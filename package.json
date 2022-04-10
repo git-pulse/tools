@@ -1,0 +1,17 @@
+{
+  "type": "module",
+  "name": "git-pulse-snapshots",
+  "version": "1.0.0",
+  "repository": "git@github.com:git-pulse/snapshots.git",
+  "author": "Michael[tm] Smith <mike@w3.org>",
+  "license": "MIT",
+  "engines": {
+    "node": ">=15.0.0"
+  },
+  "scripts": {
+    "build": "node .snapshots-process.js"
+  },
+  "devDependencies": {
+    "eslint": "^8.10.0"
+  }
+}

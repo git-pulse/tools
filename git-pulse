@@ -1,0 +1,2247 @@
+#!/bin/bash
+
+# https://github.com/git-pulse/tools#readme
+
+date="date"
+CURLOPTS=--insecure
+
+remoteURLproperty=remote.origin.url
+if [ -n "$(git config --get remote.upstream.url)" ]; then
+  remoteURLproperty=remote.upstream.url
+fi
+
+repoURL=$(git config --get $remoteURLproperty | sed -r \
+  's/.*(\@|\/\/)(.*)(\:|\/)([^:\/]*)\/([^\/]*)\.git/https:\/\/\2\/\4\/\5/')
+orgAndRepo=$(echo "$repoURL" | rev | cut -d '/' -f-2 | rev)
+
+isGitHubRepo=false
+[[ $repoURL == *"github"* ]] && isGitHubRepo=true
+
+repoMetadata=""
+if [ $isGitHubRepo = true ]; then
+  repoMetadata=$(curl -fsSL "https://api.github.com/repos/$orgAndRepo")
+fi
+
+echo "https://api.github.com/repos/$orgAndRepo/commits?per_page=1&page=1"
+
+totalCommits=$(curl -I -fsSL \
+  "https://api.github.com/repos/$orgAndRepo/commits?per_page=1&page=1" \
+  | grep -i "^link:" | cut -d ";" -f2 | cut -d "=" -f4 | sed 's/>//')
+
+forksCount=$(echo "$repoMetadata" | grep -m1 '"forks_count":' \
+  | cut -d ":" -f2 | tr -d " ,")
+
+hasIssues=false
+if echo "$repoMetadata" | grep -q '"has_issues": true,'; then
+  hasIssues=true
+fi
+
+searchBase="https://api.github.com/search/issues?q=repo:$orgAndRepo"
+linkBase="https://github.com/search?q=repo:$orgAndRepo"
+
+hasGnuplot=false
+[ "$(command -v gnuplot >/dev/null 2>&1; echo $?)" ] && hasGnuplot=true
+
+sleepseconds=9
+
+while getopts "d:is:" opt; do
+  case "$opt" in
+  d) date=$OPTARG
+    ;;
+  i) interactive=true
+    ;;
+  s) sleepseconds=$OPTARG
+    ;;
+  *)
+    exit 1
+    ;;
+  esac
+done
+shift $((OPTIND-1))
+# if no months given from command line arg, show data for past 13 months
+months=${1:-13}
+[[ $months =~ ^[0-9]+$ ]] || months=13 # if arg not integer, default to 13
+[ "$months" -gt 0 ] || months=13
+
+date="$date -u"
+$date --date="" > /dev/null 2>&1 || hasGnuDate=$?
+
+today=$($date +"%d %B %Y")
+now="$($date +"%H:%M") UTC"
+nowIso8601=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+htmlFile=pulse.html
+htmlFile=$(echo "$orgAndRepo" | tr '/' '-')-$($date +"%Y-%m-%d")-"$htmlFile"
+
+jsonFile=pulse.json
+jsonFile=$(echo "$orgAndRepo" | tr '/' '-')-$($date +"%Y-%m-%d")-"$jsonFile"
+
+hiEscape="\033[0;1m"
+hi=$hiEscape
+hiOff="\033[0m"
+
+writeDualAxisGraphToHTMLFile() {
+  LC_CTYPE="en_US.UTF-8"
+  title=$1
+  righttitle=$2
+  lefttitle=$3
+  rightcolor=$4
+  leftcolor=$5
+  id=$6
+  shift 6
+  printf '%s\n' "$@" | tac | cat - <(echo "e") \
+    | gnuplot -p -e "\
+    set term svg name '$(echo "$title" | tr -d " /+%")' size 668,440 fixed font ',16'; \
+      set style line 1 lw 2 pointtype 7 pointsize 0.5 linecolor rgb '$leftcolor';
+      set style line 2 lw 2 pointtype 7 pointsize 0.5 linecolor rgb '$rightcolor';
+      set xrange reverse;
+      set ylabel '$lefttitle' offset +1,0 textcolor rgb '$leftcolor';
+      set ytics nomirror textcolor rgb '$leftcolor';
+      set y2label '$righttitle' offset -1,0 textcolor rgb '$rightcolor' rotate by 270;
+      set y2tics textcolor rgb '$rightcolor';
+      set xlabel 'Months before $today' offset 0,+0.5;
+      set title '{/:Bold $title – $orgAndRepo}' textcolor rgb '#32cd32';
+      set key left top opaque fillcolor '0x7fcccccc' font ',12' textcolor variable;
+      set rmargin 9;
+      plot
+      '-' with linespoints title '$lefttitle' axes x1y1 ls 1,
+      '-' with linespoints title '$righttitle' axes x1y2 ls 2" \
+        | sed -E "s|(<text><tspan[^>]+>)$title – $orgAndRepo(</tspan></text>)|\1<a id='$id' href='#$id' fill='#32cd32'><tspan>🔗</tspan> $title – $orgAndRepo</a>\2|" \
+        | tail -n +2 >> "$htmlFile" \
+        2> >( grep -v "Fontconfig warning" 1>&2)
+}
+
+writeGraphToHTMLFile () {
+  LC_CTYPE="en_US.UTF-8"
+  title=$1
+  ylabel=$2
+  id=$3
+  shift 3
+  printf '%s\n' "$@" | tac | \
+  gnuplot -p -e "\
+    set term svg name '$(echo "$title" | tr -d " /+%")' size 668,440 fixed font ',16'; \
+    set xrange reverse;
+    set ylabel '$ylabel' offse +1,0 tc lt 1; \
+    set ytics tc lt 1;
+    set xlabel 'Months before $today' offset 0,+0.5;
+    set title '{/:Bold $title – $orgAndRepo}' textcolor rgb '#32cd32';
+    plot '/dev/stdin' with linespoints title '' lw 2 pointtype 7 pointsize 0.5" \
+      | sed -E "s|(<text><tspan[^>]+>)$title – $orgAndRepo(</tspan></text>)|\1<a id='$id' href='#$id' fill='#32cd32'><tspan>🔗</tspan> $title – $orgAndRepo</a>\2|" \
+      | tail -n +2 >> "$htmlFile" \
+      2> >( grep -v "Fontconfig warning" 1>&2)
+
+}
+
+writeBoxChartToHTMLFile() {
+  LC_CTYPE="en_US.UTF-8"
+  title=$1
+  ylabel=$2
+  key=$3
+  color=$4
+  labelcolor=$5
+  replacement="\1"
+  href="$(echo "$6" | sed 's/\//\\\//g')"
+  [ -n "$href" ] && replacement="<a href='$href:\1\&s=updated' fill='#0080ff'>\1<\/a>"
+  [ -n "$href" ] && yticscolor="web-blue" || yticscolor="black"
+  shift 6
+  [[ $key == *"PRs"* ]] && xlabel="Number of PRs"
+  height=$(($(echo "$@" | wc -l) * 28))
+  [ "$height" -lt 600 ] && height="600"
+  printf '%s\n' "$@" | tac | \
+  gnuplot -p -e "
+    set term svg name '$(echo "$title" | tr -d " /+%")' \
+      size 668,$height fixed font ',16';
+    set style fill transparent solid 0.5;
+    set title '$title' tc rgb '#ba5313';
+    set key opaque fillcolor '0x7fdddddd' font ',12' textcolor variable;
+    set ylabel '$ylabel' offset +1,0 tc rgb 'web-blue';
+    set ytics tc rgb '$yticscolor' scale 0;
+    set xlabel;
+    unset xtics;
+    unset border;
+    data = system('cat -'); set print \$db; print data; unset print;
+    plot \$db using (\$2*0.5):0:(\$2*0.5):(0.4):yticlabels(1) with \
+           boxxyerrorbars lc '$color' title '$key',
+         \$db using (\$2*0.5):0:(\$2*0.5):(0.5):yticlabels(1) with \
+           labels font 'arial,13' tc rgb '$labelcolor' t ''" \
+      | tail -n +2 \
+      | sed -E "s/([0-9]{4}-[0-9][0-9])/$replacement/" \
+      >> "$htmlFile" \
+      2> >( grep -v "Fontconfig warning" 1>&2)
+}
+
+showDualAxisGraphInTerminal() {
+  LC_CTYPE="en_US.UTF-8"
+  title=$1
+  righttitle=$2
+  lefttitle=$3
+  rightcolor=$4
+  leftcolor=$5
+  shift 5
+  printf '%s\n' "$@" | tac | cat - <(echo "e") \
+    | gnuplot -p -e "\
+      set term sixelgd size 1225,800 font arial 22;
+      set style line 1 lw 3 pointtype 7 pointsize 1.5 linecolor rgb '$leftcolor';
+      set style line 2 lw 3 pointtype 7 pointsize 1.5 linecolor rgb '$rightcolor';
+      set xrange reverse;
+      set ylabel '$lefttitle' textcolor rgb '$leftcolor';
+      set ytics nomirror textcolor rgb '$leftcolor';
+      set y2label '$righttitle' textcolor rgb '$rightcolor' rotate by 270;
+      set y2tics textcolor rgb '$rightcolor';
+      set xlabel 'Months before $today';
+      set title '$title – $orgAndRepo';
+      set key left top opaque fillcolor '0x7fdddddd' height .8 font ',16';
+      plot
+      '-' with linespoints title '$lefttitle' axes x1y1 ls 1,
+      '-' with linespoints title '$righttitle' axes x1y2 ls 2" \
+        2> >( grep -v "Fontconfig warning" 1>&2)
+}
+
+showGraphInTerminal() {
+  LC_CTYPE="en_US.UTF-8"
+  title=$1
+  ylabel=$2
+  shift 2
+  printf '%s\n' "$@" | tac | \
+  gnuplot -p -e "\
+    set term sixelgd size 1225,800 font arial 22;
+    set xrange reverse; \
+    set ylabel '$ylabel' tc lt 1;
+    set ytics tc lt 1;
+    set xlabel 'Months before $today';
+    set title '$title – $orgAndRepo';
+    plot '/dev/stdin' with linespoints title '' lw 3 pointtype 7 pointsize 1.5" \
+      2> >( grep -v "Fontconfig warning" 1>&2)
+}
+
+showBoxChartInTerminal() {
+  LC_CTYPE="en_US.UTF-8"
+  title=$1
+  ylabel=$2
+  key=$3
+  color=$4
+  labelcolor=$5
+  shift 5
+  xlabel="Number of issues"
+  [[ $key == *"PRs"* ]] && xlabel="Number of PRs"
+  height=$(($(echo "$@" | wc -l) * 55))
+  [ "$height" -lt 600 ] && height="600"
+  printf '%s\n' "$@" | tac | \
+  gnuplot -p -e "set term sixelgd size 1225,$height font arial 20;
+    set ylabel '$ylabel';
+    set title '$title – $orgAndRepo';
+    set xlabel '$xlabel';
+    set style fill transparent solid 0.5;
+    set key opaque fillcolor '0x7fdddddd' height .8 font ',16';
+    data = system('cat -'); set print \$db; print data; unset print;
+    plot \$db using (\$2*0.5):0:(\$2*0.5):(0.4):yticlabels(1) with \
+           boxxyerrorbars lc '$color' title '$key',
+         \$db using (\$2*0.5):0:(\$2*0.5):(0.5):yticlabels(1) with \
+           labels font 'arial,17' tc rgb '$labelcolor' offset 0,-.2 t ''" \
+    2> >( grep -v "Fontconfig warning" 1>&2)
+}
+
+collectStats() {
+  stats=$(echo "$@" | gnuplot -e 'stats "-"' 2>&1)
+  records=$(echo "$stats" | grep "Records:" \
+    | cut -d ":" -f2 | tr -d ' ' | awk '{print int($1+0.5)}')
+  minimum=$(echo "$stats" | grep "Minimum:" \
+    | cut -d ":" -f2 | tr -d ' ' | awk '{print int($1+0.5)}')
+  maximum=$(echo "$stats" | grep "Maximum:" \
+    | cut -d ":" -f2 | tr -d ' ' | awk '{print int($1+0.5)}')
+  firstQu=$(echo "$stats" | grep "Quartile:" | head -n1 \
+    | cut -d ":" -f2 | tr -d ' ' | awk '{print int($1+0.5)}')
+  median=$(echo "$stats" | grep "Median:" \
+    | cut -d ":" -f2 | tr -d ' ' | awk '{print int($1+0.5)}')
+  mean=$(echo "$stats" | grep "Mean:" \
+    | cut -d ":" -f2 | tr -d ' ' | awk '{print int($1+0.5)}')
+  thirdQu=$(echo "$stats" | grep "Quartile:" | tail -n1 \
+    | cut -d ":" -f2 | tr -d ' ' | awk '{print int($1+0.5)}')
+  stdDev=$(echo "$stats" | grep "Sample StdDev:" \
+    | cut -d ":" -f2 | tr -d ' ' | awk '{print int($1+0.5)}')
+  days90th="$(echo "$@" \
+    | sed -n "$(( 90 * $(echo "$@" | wc -l) / 100))"p)"
+  if [ -z "$days90th" ]; then
+    days90th="$1"
+  fi
+}
+
+showStatsInTerminal() {
+  minimu="$(printf "%7s" "$1")"
+  maximu="$(printf "%7s" "$2")"
+  shift 2
+  collectStats "$@"
+  echo "┌─────────┬─────────┬─────────┬─────────┬─────────┬─────────┬─────────┐"
+  echo "│ $minimu │  1st Qu │  Median │    Mean │  3rd Qu │   𝜂90th │ $maximu │"
+  echo "├─────────┼─────────┼─────────┼─────────┼─────────┼─────────┼─────────┤"
+    echo -n  "│ $(printf "%7s" "$minimum")"
+    echo -n " │ $(printf "%7s" "$firstQu")"
+    echo -n " │ $(printf "%7s" "$median")"
+    echo -n " │ $(printf "%7s" "$mean")"
+    echo -n " │ $(printf "%7s" "$thirdQu")"
+    echo -n " │ $(printf "%7s" "$days90th")"
+    echo -n " │ $(printf "%7s" "$maximum")"
+    echo    " │"
+  echo "│    days │    days │    days │    days │    days │    days │    days │"
+  echo "└─────────┴─────────┴─────────┴─────────┴─────────┴─────────┴─────────┘"
+  echo "  Standard deviation: $stdDev days"
+}
+
+writeStatsToHTMLFile() {
+  minim="$(printf "%6s" "$1")"
+  maxim="$(printf "%6s" "$2")"
+  id="$3"
+  shift 3
+  collectStats "$@"
+  cat << EOF >> "$htmlFile"
+    <table class="simple" id="$id">
+      <caption><a href="#$id"><span>🔗</span> $heading</a>
+      <thead>
+        <tr>
+          <th>$minim
+          <th>1st Qu
+          <th>Median
+          <th>Mean
+          <th>3rd Qu
+          <th>𝜂90th
+          <th>$maxim
+      </thead>
+        <tr>
+          <td>$minimum days
+          <td>$firstQu days
+          <td>$median days
+          <td>$mean days
+          <td>$thirdQu days
+          <td>$days90th days
+          <td>$maximum days
+      <tfoot>
+         <tr>
+           <td colspan=8>Standard deviation: $stdDev days
+    </table>
+EOF
+}
+
+getDaysBetweenTwoDates() {
+  if [ "$hasGnuDate" != 1 ]; then
+    days=$((($($date -u --date="$1" +"%s") \
+      - $($date -u --date="$2" +"%s"))/86400))
+  else
+    # BSD date(1) (used on, e.g., macOS)
+    days=$((($($date -jf "%Y-%m-%dT%H:%M:%SZ" "$1" +%s) \
+      - $($date -jf "%Y-%m-%dT%H:%M:%SZ" "$2" +%s))/86400))
+  fi
+  echo -n "$days"
+}
+
+divide() {
+  if [ "$2" = 0 ]; then
+    echo "$1 1" | awk '{ printf("%.2f\n",  ( $1 / $2 )) }'
+  else
+    echo "$1 $2" | awk '{ printf("%.2f\n",  ( $1 / $2 )) }'
+  fi
+}
+
+if [ "$(git rev-parse --is-inside-work-tree 2>/dev/null)" != "true" ]; then
+  echo
+  echo -n -e \
+    "${hi}Error:${hiOff} This tool must be run from within a git repo." >&2
+  echo -e " Stopping." >&2
+  exit 1;
+fi
+
+if [ "$hasGnuDate" != 1 ]; then
+  startDate=$($date -u --date="-$months month" +"%Y-%m-%dT%H:%M:%SZ")
+else
+  # BSD date(1) (used on, e.g., macOS)
+  startDate=$($date -u -v-"$months"m +"%Y-%m-%dT%H:%M:%SZ")
+fi
+ endDate=$($date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+cat << EOF > "$htmlFile"
+<!doctype html><html lang=en><meta charset=utf-8>
+<title>$orgAndRepo - pulse snapshot for $today</title>
+<style>
+  body { font-family: sans-serif; }
+  body > section { margin-right: 64px; justify-content: center; }
+  body > section { display: flex; flex-flow: row wrap; padding-top: 20px }
+  section img { padding-top: 24px; padding-right: 12px; }
+  body > div { display: flex; flex-flow: row wrap; padding-top: 20px }
+  .bargraph { display: flex; flex-direction: column }
+  .bargraph .svg { flex: 1 0 auto }
+  .bargraph p { margin: 0 0 10px 0 }
+  .months_summary { padding: 2px 20px; }
+  .months_summary p { padding: 0; }
+  h1 { font-size: 28px; text-align: center; }
+  h1, h2, h3, h4 { color: #32cd32; }
+  h1, h2, h3 { text-align: center; }
+  h4 { margin-left: -21px; }
+  h2 span, h3 span, h4 span { visibility: hidden; font-size: .85em;  }
+  h2:hover span, h3:hover span, h4:hover span { visibility: visible; }
+  h2:hover span, h3:hover span, h4:hover span { opacity: .6; }
+  h2 a, h3 a, h4 a { color: #32cd32; text-decoration: none; }
+  h2 a:visited { color: #32cd32; text-decoration: none; }
+  h3 a:visited { color: #32cd32; text-decoration: none; }
+  h4 a:visited { color: #32cd32; text-decoration: none; }
+  h3 { margin: 64px 0 14px 0 }
+  h2 + p { text-align: center }
+  h3 ~ p { text-align: center }
+  section + h2 { padding: 48px 0 0 0; border-top: 2px solid #eee }
+  .links { text-align: center; }
+  #committer-pulse { margin-top: 48px; }
+  table { text-align: right; }
+  table:not(.simple) { width: 676px; height: 442px; }
+  table.simple { width: 670px; margin-left: 6px }
+  table { margin: 2px 5px 16px 0; border: 1px solid #ccc; }
+  thead { text-align: center; vertical-align: bottom }
+  th, td { padding: 8px; }
+  th { background: #eee; font-size: .95em; color: #32cd32; }
+  tbody tr { font-family: monospace; font-size: 13px }
+  td { padding: 4px 8px; }
+  table:not(.simple):first-of-type td:nth-of-type(6n) { text-align: left; }
+  table caption { padding-bottom: 6px; margin-top: 8px; }
+  table caption { font-weight: bold; color: #32cd32; }
+  table caption a { color: #32cd32; text-decoration: none }
+  table caption a:visited { color: #32cd32; text-decoration: none }
+  table caption span { visibility: hidden; font-size: .85em; }
+  table caption:hover span { visibility: visible; opacity: .6; }
+  table:not(.simple) td:nth-of-type(8n) { text-align: left; }
+  td a { font-weight: normal; }
+  tbody tr:nth-child(even) { background: #eee; }
+  tbody tr:nth-child(even) { font-weight: bold; color: #32cd32; }
+  tfoot tr td { border-top: 1px solid #ccc; padding-top: 8px }
+  tfoot tr td { text-align: center; font-size: 13px;}
+  code { color: orangered; font-size: 15px; font-weight: bold }
+  svg { border: 1px solid #ccc; margin-top: 2px; margin-left: 6px }
+  svg + h2 { margin-top: 96px; }
+  p img { vertical-align: middle; padding-bottom: 6px; padding-left: 8px; }
+  svg a { text-decoration: underline; }
+  svg tspan a[id] { text-decoration: none; }
+  svg tspan a[id] tspan { visibility: hidden; font-size: .85em; }
+  svg tspan a[id]:hover tspan { visibility: visible; opacity: .6; }
+</style>
+<section>
+  <div>
+  <a href="https://github.com/git-pulse/tools"><img height=75 alt="git-pulse logo" src="data:image/svg+xml;charset=utf-8;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNzkuMDggMzM2LjUyIj4KICA8cmFkaWFsR3JhZGllbnQKICAgICAgaWQ9InJhZGlhbEdyYWRpZW50MzczNCIKICAgICAgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiCiAgICAgIGN5PSI2OTAuMjgiCiAgICAgIGN4PSI0NjcuNzEiCiAgICAgIGdyYWRpZW50VHJhbnNmb3JtPSJtYXRyaXgoMTQuNTcyIC0uMDAyMDExOSAuMDE2OTM5IDE4MC4wOSAtNjM1OS40IC0xLjIzNDVlNSkiCiAgICAgIHI9IjQwLjYyMyI+CiAgICA8c3RvcCBpZD0ic3RvcDM3MzAiIHN0eWxlPSJzdG9wLWNvbG9yOiMzMmNkMzIiIG9mZnNldD0iMCIgLz4KICAgIDxzdG9wIGlkPSJzdG9wMzczMiIgc3R5bGU9InN0b3AtY29sb3I6IzMyY2QzMjtzdG9wLW9wYWNpdHk6MCIgb2Zmc2V0PSIxIiAvPgogIDwvcmFkaWFsR3JhZGllbnQ+CiAgPGcgaWQ9ImxheWVyMSIgdHJhbnNmb3JtPSJ0cmFuc2xhdGUoLTQ2Ny43MSAtNjIzLjUzKSI+CiAgICA8cGF0aCBpZD0icGF0aDIzOTYiCiAgICAgICAgc3R5bGU9InN0cm9rZTp1cmwoI3JhZGlhbEdyYWRpZW50MzczNCk7c3Ryb2tlLXdpZHRoOjI0LjA0NTtmaWxsOm5vbmUiCiAgICAgICAgZD0ibTQ3OS43MyA4NTAuNjhzMTkuNjkgMTEgMjYuMzUgMTcuODRjMTAgMTAuMjcgMTkuMDUgNTIuOTggMjUuNyA0MC4yOCA0MC4yLTc2Ljc2IDU4LjEyLTI3My4yNSA1OC4xMi0yNzMuMjVzMC4zNyAxMjUuMzkgNy40MyAxNzguNTNjNS4zNCA0MC4yNiAxOS42NyAxNDkuNzEgMjkuODcgMTMyLjAyIDE3LjAyLTI5LjUxIDIyLjYzLTg3LjE2IDMyLjk3LTEyNi42NSA0Ljk1LTE4LjkyIDE4LjYzIDM3Ljk3IDMxLjIzIDU3LjI2IDUuNzIgOC43NiA0Ljk2LTMzLjE5IDE1LjYxLTMyLjEgMjYuMDMgMi42NiAyNy43NiAwLjg3IDI3Ljc2IDAuODciIC8+CiAgPC9nPgo8L3N2Zz4K"></a>
+  </div>
+  <div>
+  <h1>Pulse snapshot for $today</h1>
+  <h2><a href="$repoURL">$repoURL</a></h2>
+  <p><a href="$jsonFile">JSON snapshot also available</a>
+  </div>
+</section>
+<p class="links">
+Committers:
+<a href="#committers-months-summary">summary</a>
+•
+<a href="#committer-pulse">month-by-month</a>
+•
+graphs:
+<a href="#committers_per_month">committers per month</a>
+•
+<a href="#commits_per_month">commits per month</a>
+•
+<a href="#total_committers">total committers</a>
+
+<p class="links">
+Issues:
+<a href="#open-issues">open</a>
+•
+<a href="#issues-resolved">resolved</a>
+•
+<a href="#issues-and-prs-months-summary">summary</a>
+•
+<a href="#issue-and-pr-pulse">month-by-month</a>
+•
+<a href="#open-issues-age-stats">age stats</a>
+•
+<a href="#closed-issues-ttc-stats">time-to-close stats</a>
+•
+graphs:
+<a href="#issues_closed_opened">opened/closed</a>
+•
+<a href="#increase_decrease">increase/decrease</a>
+
+<p class="links">
+PRs:
+<a href="#open-prs">open</a>
+•
+<a href="#prs-merged-closed">merged/closed</a>
+•
+<a href="#issues-and-prs-months-summary">summary</a>
+•
+<a href="#issue-and-pr-pulse">month-by-month</a>
+•
+<a href="#open-prs-age-stats">age stats</a>
+•
+<a href="#merged-closed-prs-ttc-stats">time-to-close stats</a>
+•
+graphs:
+<a href="#PRs_merged_closed_opened">opened/merged/closed</a>
+•
+<a href="#increase_decrease">increase/decrease</a>
+EOF
+
+uniqCommittersArray=()
+newCommittersArray=()
+newToUniqArray=()
+commitsArray=()
+$date --date="" > /dev/null 2>&1 || hasGnuDate=$?
+echo
+echo -e " ${hi}$repoURL${hiOff}"
+echo
+echo "           Committers"
+echo "┌────────────────────┬───────┐"
+echo "│      Monthly       │ Cu-   │"
+echo "├─────┬───────┬──────┤ mula- │ Monthly"
+echo "│ New │ Total │ %New │ tive  │ commits             Month range"
+echo "├─────┼───────┼──────┼───────┼───────┬────────────────────────────────────────┐"
+
+cat << EOF >> "$htmlFile"
+<h2 id="committer-pulse"><a href="#committer-pulse"><span>🔗</span>
+  Committer pulse</a></h2>
+<div>
+  <table id="committers-table">
+    <thead>
+      <tr>
+        <th colspan=4>Committers
+        <th rowspan=3>Mo-<br>nthly<br>com-<br>mits
+        <th rowspan=3>Month range
+      <tr>
+        <th colspan=3>Monthly
+        <th rowspan=2>Cu-<br>mula-<br>tive
+      <tr>
+        <th>New
+        <th>Uniq
+        <th>%New
+    </thead>
+EOF
+for (( i=months - 1; i >= 0; i-- )); do
+  hi=''
+  [ $((i%2)) -eq 0 ] && hi=$hiEscape
+  if [ -z "$allCommittersPrevious" ]; then
+    allCommittersPrevious=$(git shortlog -s --no-merges \
+      --before="$((i + 1)) months back" | wc -l)
+  else
+    allCommittersPrevious=$allCommitters
+  fi
+  allCommitters=$(git shortlog -s --no-merges \
+    --before="$i months back" | wc -l | xargs)
+  if [ "$i" -eq "$((months - 1))" ]; then
+    initialAllCommitters=$allCommitters
+  fi
+  newCommitters=$((allCommitters - allCommittersPrevious))
+  uniqCommitters=$(git shortlog -s --no-merges --before="$i months back" \
+    --since="$((i + 1)) months back" | wc -l | xargs)
+  newToUniqPercentage=0
+  [ "$uniqCommitters" -gt 0 ] && newToUniqPercentage="$(echo \
+    "$(echo "$newCommitters / $uniqCommitters" | bc -l) \
+    * 100 / 1" | bc)"
+  monthlyCommits=$(git log --no-merges --oneline --before="$i months back" \
+    --since="$((i + 1)) months back" | wc -l | xargs)
+  newCommittersArray+=("$newCommitters")
+  uniqCommittersArray+=("$uniqCommitters")
+  newToUniqArray+=("$newToUniqPercentage")
+  commitsArray+=("$monthlyCommits")
+  allCommittersArray+=("$allCommitters")
+  echo -n -e "│ ${hi}$(printf "%3s" "$newCommitters")${hiOff} "
+  echo -n -e "│ ${hi}$(printf "%5s" "$uniqCommitters")${hiOff} "
+  echo -n -e "│ ${hi}$(printf "%4s" "$newToUniqPercentage")${hiOff} "
+  echo -n -e "│ ${hi}$(printf "%5s" "$allCommitters")${hiOff} "
+  echo -n -e "│ ${hi}$(printf "%5s" "$monthlyCommits")${hiOff} "
+cat << EOF >> "$htmlFile"
+    <tr>
+      <td>$newCommitters
+      <td>$uniqCommitters
+      <td>$newToUniqPercentage
+      <td>$allCommitters
+      <td>$monthlyCommits
+EOF
+  echo -n '    <td>' >> "$htmlFile"
+  if [ "$hasGnuDate" != 1 ]; then
+    # echo -n -e "│ ${hi}$($date \
+      # --date "$($date --date="-$((i + 1)) month") +1 day" +"%b %d")"
+    echo -n -e "│ ${hi}$($date --date="-$((i + 1)) month" +"%b %d")"
+    echo -n -e " – $($date --date="-$i month" +"%b %d %Y")"
+    # echo -n "$($date \
+      # --date "$($date --date="-$((i + 1)) month") +1 day" +"%b %d")" \
+      # >> "$htmlFile"
+    echo -n "$($date --date="-$((i + 1)) month" +"%b %d")" \
+      >> "$htmlFile"
+    echo -n " – $($date --date="-$i month" +"%b %d %Y")" >> "$htmlFile"
+  else
+    # BSD date(1) (used on, e.g., macOS)
+    # echo -n -e "│ ${hi}$($date -j -v+1d -f "%Y-%m-%d" \
+      # "$($date -v-"$((i + 1))"m +"%Y-%m-%d")" +"%b %d")"
+    echo -n -e "│ ${hi}$($date -v-"$((i + 1))"m +"%b %d")"
+    echo -n -e " – $($date -v-"$i"m +"%b %d %Y")"
+    # echo -n "$($date -j -v+1d -f "%Y-%m-%d" \
+      # "$($date -v-"$((i + 1))"m +"%Y-%m-%d")" +"%b %d")" >> "$htmlFile"
+    echo -n "$($date -v-"$((i + 1))"m +"%b %d")" >> "$htmlFile"
+    echo -n " – $($date -v-"$i"m +"%b %d %Y")" >> "$htmlFile"
+  fi
+  if [ "$i" -eq 0 ]; then
+    echo -e " ending $now${hiOff}  │"
+    echo " ending $now" >> "$htmlFile"
+  else
+    echo -e " ending $(printf "%-10s" $i"mo back")${hiOff} │"
+    echo " ending ${i}mo back" >> "$htmlFile"
+  fi
+done
+echo "└─────┴───────┴──────┴───────┴───────┴────────────────────────────────────────┘"
+echo "  </table>" >> "$htmlFile"
+
+avgNewCommitters=$(($(tot=0;
+  for i in "${newCommittersArray[@]}"; \
+    do ((tot+=i)); done; echo $tot) / months))
+avgUniqCommitters=$(($(tot=0;
+  for i in "${uniqCommittersArray[@]}"; \
+    do ((tot+=i)); done; echo $tot) / months))
+avgCommits=$(($(tot=0;
+  for i in "${commitsArray[@]}"; \
+    do ((tot+=i)); done; echo $tot) / months))
+newToUniqPercentage=0
+[ $avgUniqCommitters -gt 0 ] && newToUniqPercentage="$(echo \
+  "$(echo "$avgNewCommitters / $avgUniqCommitters" | bc -l) \
+  * 100 / 1" | bc)"
+
+hi=$hiEscape
+[ "$months" -gt 1 ] || exit 0
+echo
+echo " For the last $months months:"
+echo
+echo -n "$(printf "%8s" "$avgNewCommitters")"
+echo " new committers per month on average."
+echo -n -e "${hi}$(printf "%8s" "$avgUniqCommitters")"
+echo -e " total active committers per month on average.${hiOff}"
+echo -n -e "$(printf "%8s" "$newToUniqPercentage")"
+echo -e " percent of committers were new committers."
+echo -n -e "${hi}$(printf "%8s" "$avgCommits")"
+echo -e " commits per month on average.${hiOff}"
+echo -n -e "$(printf "%8s" "$(divide $avgCommits $avgUniqCommitters)")"
+echo -e " commits per committer per month on average."
+echo
+
+echo -n -e " Cumulative total committers grew by"
+echo -n -e " ${hi}$((allCommitters - initialAllCommitters))${hiOff}"
+echo -n -e " (from ${hi}$initialAllCommitters${hiOff}"
+echo -n -e " to ${hi}$allCommitters${hiOff})"
+echo -n -e " in $((months - 1))"
+
+if [ $hasGnuplot != true ]; then
+cat << EOF >> "$htmlFile"
+<p>
+To see graphs, install <code>gnuplot</code> — e.g.,
+with <code>apt install gnuplot</code> (Ubuntu),
+or <code>brew install gnuplot</code> (macOS).
+EOF
+else
+writeDualAxisGraphToHTMLFile \
+  "Committers per month" \
+  "Total committers" \
+  "New committers" \
+  "dark-salmon" "forest-green" \
+  "committers_per_month" \
+  "${uniqCommittersArray[@]}" "e" "${newCommittersArray[@]}"
+fi
+
+cat << EOF >> "$htmlFile"
+  <div class="months_summary" id="committers-months-summary">
+  <h4><a href="#committers-months-summary"><span>🔗</span>
+    For the last $months months:</a></h4>
+    <ul>
+      <li>$avgNewCommitters new committers per month on average.
+      <li>$avgUniqCommitters total active committers per month on average.
+      <li>$newToUniqPercentage percent of committers were new committers.
+      <li>$avgCommits commits per month on average.
+      <li>$(divide $avgCommits $avgUniqCommitters) commits per committer
+      per month on average.
+    </ul>
+    <p>Cumulative total committers grew by
+    $((allCommitters - initialAllCommitters))
+    (from $initialAllCommitters to $allCommitters) in $((months - 1))
+EOF
+if [ "$months" -gt 2 ]; then
+  echo -e " months.${hiOff}"
+  echo " months." >> "$htmlFile"
+else
+  echo -e " month.${hiOff}"
+  echo " month." >> "$htmlFile"
+fi
+echo "  </div>" >> "$htmlFile"
+# end of committer summary section
+echo "</div>" >> "$htmlFile"
+# end of committer upper container
+
+if [ $hasGnuplot = true ]; then
+  writeDualAxisGraphToHTMLFile \
+    "Total committers and % new" \
+    "Cumulative total committers" \
+    "New commiters percentage" \
+    "orange" "web-blue" \
+    "total_committers" \
+    "${allCommittersArray[@]}" "e" "${newToUniqArray[@]}"
+  writeGraphToHTMLFile \
+    "Commits per month" \
+    "Commits per month" \
+    "commits_per_month" \
+    "${commitsArray[@]}"
+else
+  echo -n " To see graphs, install gnuplot;";
+  echo " e.g., with 'apt install gnuplot' (Ubuntu),";
+  echo "or 'brew install gnuplot' (macOS).";
+fi
+
+echo
+echo " ────────────────────────────────────────────────────────────────────────────"
+echo
+
+if [[ $interactive = true ]]; then
+echo -n -e " ${hi}$htmlFile${hiOff}"
+echo -e " will be generated as you page"
+echo -e " through the rest of this snapshot in the terminal."
+echo
+read -rsp $' Press any key to continue, or Ctrl-C to exit...\n' -n1 \
+  && tput cuu1 && tput el
+echo
+fi
+
+showDualAxisGraphInTerminal "Committers per month" \
+  "Total active committers" "New committers" \
+  "dark-salmon" "forest-green" \
+  "${uniqCommittersArray[@]}" "e" "${newCommittersArray[@]}"
+[[ $interactive = true ]] && read -rsp \
+  $'Press any key to see next committer graph...\n' -n1 \
+  && tput cuu1 && tput el; echo
+showDualAxisGraphInTerminal "Total committers and % new" \
+  "Cumulative total committers" "New committers percentage" \
+    "orange" "medium-blue" \
+  "${allCommittersArray[@]}" "e" "${newToUniqArray[@]}"
+[[ $interactive = true ]] && read -rsp \
+  $'Press any key to see final committer graph...\n' -n1 \
+  && tput cuu1 && tput el; echo
+showGraphInTerminal "Commits per month" \
+  "Commits per month" "${commitsArray[@]}"
+
+if [ $isGitHubRepo != true ]; then
+  exit
+fi
+
+if [ -z "$orgAndRepo" ]; then
+  echo
+  echo -n -e \
+    "${hi}Error:${hiOff} This tool must be run from within a clone " >&2
+  echo -e "of a GitHub repo. Stopping." >&2
+  exit 1;
+fi
+
+if [ $hasIssues = true ]; then
+  snapshotType="issues"
+else
+  snapshotType="PRs"
+  echo -n -e "${hi}"
+cat << EOF
+         Note: The GitHub issue tracker for this repo is disabled.
+               The snapshot will include data for PRs only.
+
+EOF
+  echo -n -e "${hiOff}"
+fi
+
+[[ $interactive = true ]] && read -rsp \
+  "Press any key to start generating the $snapshotType snapshot..."$'\n' \
+  -n1 && tput cuu1 && tput el; echo
+
+cat << EOF
+ ───────────────────────────────────────────────────────────────────────────
+EOF
+
+cat << EOF
+  Generating the $snapshotType snapshot takes a few minutes, due to GitHub
+  API rate limits. If you hit the limits, you’ll get 403 errors here. So,
+  to adjust the number of seconds between API calls, use the -s option:
+EOF
+echo
+echo -e "       ${hi}bash ${BASH_SOURCE[*]} -s10${hiOff}"
+cat << EOF
+ ───────────────────────────────────────────────────────────────────────────
+EOF
+
+if [ -n "$GITHUB_TOKEN" ]; then
+  token="$GITHUB_TOKEN";
+elif [ -n "$GH_TOKEN" ]; then
+  token="$GH_TOKEN";
+else
+  echo
+  echo -n -e \
+    "${hi}Warning:${hiOff} No GITHUB_TOKEN or GH_TOKEN set. " >&2
+  echo -e "Requests will be unauthenticated." >&2
+fi
+
+if [ -n "$token" ]; then
+  authorizationHeader="Authorization: token $GITHUB_TOKEN"
+fi
+
+issuesClosedArray=()
+issuesOpenedArray=()
+issuesDeltaArray=()
+PRsMergedArray=()
+PRsClosedArray=()
+PRsMergedOrClosedArray=()
+PRsOpenedArray=()
+PRsDeltaArray=()
+
+$date --date="" > /dev/null 2>&1 || hasGnuDate=$?
+echo
+echo -e " ${hi}$repoURL${hiOff}"
+echo "┌────────────────┬─────────────────────┐"
+echo "│     Issues     │         PRs         │"
+echo "├────────────────┼─────────────────────┤"
+echo "│ Clsd Opnd   +- │ Mrgd Clsd Opnd   +- │             Month range"
+echo "├────────────────┼─────────────────────┼────────────────────────────────────────┐"
+
+issuesNote=""
+if [ $hasIssues != true ]; then
+  issuesNote="\
+<p><b>Note: The GitHub issue tracker for this repo is disabled.
+   This snapshot includes data for PRs only.</b>"
+fi
+cat << EOF >> "$htmlFile"
+<h2 id="issue-and-pr-pulse"><a href="#issue-and-pr-pulse"><span>🔗</span>
+  Issue and PR pulse</a></h2>
+$issuesNote
+<div>
+  <table id="issues-and-prs-table">
+    <thead>
+      <tr>
+        <th colspan=3>Issues
+        <th colspan=4>PRs
+        <th rowspan=2>Month range
+      <tr>
+        <th>Clsd
+        <th>Opnd
+        <th>+ -
+        <th>Mrgd
+        <th>Clsd
+        <th>Opnd
+        <th>+ -
+    </thead>
+EOF
+
+currentStart=$startDate
+currentEnd=$endDate
+for (( i=months - 1; i >= 0; i-- )); do
+  tput sc
+  echo -n "☕️ Getting monthly issue and PR data ($((months - i))/$months)"
+  if [ $i -ne $((months - 1)) ]; then
+    for (( j=1; j <=sleepseconds; j++)); do
+      sleep 1
+      echo -n "."
+    done
+  fi
+  hi=''
+  [ $((i%2)) -eq 0 ] && hi=$hiEscape
+  if [ "$hasGnuDate" != 1 ]; then
+    currentStart=$($date --date \
+      "$($date --date="-$((i + 1)) month") +1 day" +"%Y-%m-%d")
+    currentEnd=$($date --date="-$i month" +"%Y-%m-%d")
+  else
+    # BSD date(1) (used on, e.g., macOS)
+    currentStart="$($date -j -v+1d -f "%Y-%m-%d" \
+      "$($date -v-"$((i + 1))"m +"%Y-%m-%d")" +"%Y-%m-%d")"
+    currentEnd=$($date -v-"$i"m +"%Y-%m-%d")
+  fi
+  issuesClosedQuery="type:issue+closed:$currentStart..$currentEnd"
+  issuesOpenedQuery="type:issue+created:$currentStart..$currentEnd"
+  PRsMergedQuery="type:pr+merged:$currentStart..$currentEnd"
+  PRsClosedQuery="type:pr+is:unmerged+closed:$currentStart..$currentEnd"
+  PRsOpenedQuery="type:pr+created:$currentStart..$currentEnd"
+  issuesClosedResponseString="$(printf "%4s" \
+    "$(curl -i $CURLOPTS -H "$authorizationHeader" -fsSL \
+    "$searchBase+$issuesClosedQuery")")"
+  echo -n "."
+  realdate="$(echo "$issuesClosedResponseString" \
+    | grep -i "^date:" | cut -c12-22)"
+  if [ "$hasGnuDate" != 1 ]; then
+    realdateYmd="$($date --date="$realdate" +"%Y-%m-%d")"
+  else
+    realdateYmd="$(date -j -f "%d %b %Y" "$realdate" +"%Y-%m-%d")"
+  fi
+  issuesClosed="$(printf "%4s" "$(echo "$issuesClosedResponseString" \
+    | grep '^  "total_count"' | cut -d ':' -f2- | sed 's/,//' | xargs)")"
+  issuesOpened="$(printf "%4s" \
+    "$(curl $CURLOPTS -H "$authorizationHeader" -fsSL \
+    "$searchBase+$issuesOpenedQuery" \
+    | grep '^  "total_count"' | cut -d ':' -f2- | sed 's/,//' | xargs)")"
+  echo -n "."
+  issuesDelta=$((issuesOpened - issuesClosed))
+  sign="" && [[ "$issuesDelta" -gt 0 ]] && sign="+"
+  issuesDelta=$(printf "%4s" "$sign$issuesDelta")
+  PRsMerged="$(printf "%4s" \
+    "$(curl $CURLOPTS -H "$authorizationHeader" -fsSL \
+    "$searchBase+$PRsMergedQuery" \
+    | grep '^  "total_count"' | cut -d ':' -f2- | sed 's/,//' | xargs)")"
+  echo -n "."
+  PRsClosed="$(printf "%4s" \
+    "$(curl $CURLOPTS -H "$authorizationHeader" -fsSL \
+    "$searchBase+$PRsClosedQuery" \
+    | grep '^  "total_count"' | cut -d ':' -f2- | sed 's/,//' | xargs)")"
+  echo -n "."
+  PRsMergedOrClosed=$((PRsMerged + PRsClosed))
+  PRsOpened="$(printf "%4s" \
+    "$(curl $CURLOPTS -H "$authorizationHeader" -fsSL \
+    "$searchBase+$PRsOpenedQuery" \
+    | grep '^  "total_count"' | cut -d ':' -f2- | sed 's/,//' | xargs)")"
+  # erase coffee line
+  tput rc && tput el
+
+  PRsDelta=$((PRsOpened - PRsMerged - PRsClosed))
+  sign="" && [[ "$PRsDelta" -gt 0 ]] && sign="+"
+  PRsDelta=$(printf "%4s" "$sign$PRsDelta")
+  issuesClosedArray+=("$issuesClosed")
+  issuesOpenedArray+=("$issuesOpened")
+  issuesDeltaArray+=("$issuesDelta")
+  PRsMergedArray+=("$PRsMerged")
+  PRsClosedArray+=("$PRsClosed")
+  PRsMergedOrClosedArray+=("$PRsMergedOrClosed")
+  PRsOpenedArray+=("$PRsOpened")
+  PRsDeltaArray+=("$PRsDelta")
+  echo -n -e "│ ${hi}$issuesClosed${hiOff}"
+  echo -n -e " ${hi}$issuesOpened${hiOff}"
+  echo -n -e " ${hi}$issuesDelta${hiOff} "
+  echo -n -e "│ ${hi}$PRsMerged${hiOff}"
+  echo -n -e " ${hi}$PRsClosed${hiOff}"
+  echo -n -e " ${hi}$PRsOpened${hiOff}"
+  echo -n -e " ${hi}$PRsDelta${hiOff} "
+
+cat << EOF >> "$htmlFile"
+    <tr>
+      <td><a href="$linkBase+$issuesClosedQuery">$issuesClosed</a>
+      <td><a href="$linkBase+$issuesOpenedQuery">$issuesOpened</a>
+      <td>$issuesDelta
+      <td><a href="$linkBase+$PRsMergedQuery">$PRsMerged</a>
+      <td><a href="$linkBase+$PRsClosedQuery">$PRsClosed</a>
+      <td><a href="$linkBase+$PRsOpenedQuery">$PRsOpened</a>
+      <td>$PRsDelta
+EOF
+  echo -n '    <td>' >> "$htmlFile"
+  if [ "$hasGnuDate" != 1 ]; then
+    # echo -n -e "│ ${hi}$($date --date \
+      # "$($date --date="-$((i + 1)) month") +1 day" +"%b %d")"
+    echo -n -e "│ ${hi}$($date --date="-$((i + 1)) month" +"%b %d")"
+    echo -n -e " - $($date --date="-$i month" +"%b %d %Y")"
+    # echo -n "$($date --date \
+      # "$($date --date="-$((i + 1)) month") +1 day" +"%b %d")" \
+      # >> "$htmlFile"
+    echo -n "$($date --date="-$((i + 1)) month" +"%b %d")" \
+      >> "$htmlFile"
+    echo -n " – $($date --date="-$i month" +"%b %d %Y")" >> "$htmlFile"
+  else
+    # BSD date(1) (used on, e.g., macOS)
+    # echo -n -e "│ ${hi}$($date -j -v+1d -f "%Y-%m-%d" \
+      # "$($date -v-"$((i + 1))"m +"%Y-%m-%d")" +"%b %d")"
+    echo -n -e "│ ${hi}$($date -v-"$((i + 1))"m +"%b %d")"
+    echo -n -e " – $($date -v-"$i"m +"%b %d %Y")"
+    # echo -n "$($date -j -v+1d -f "%Y-%m-%d" \
+      # "$($date -v-"$((i + 1))"m +"%Y-%m-%d")" +"%b %d")" >> "$htmlFile"
+    echo -n "$($date -v-"$((i + 1))"m +"%b %d")" >> "$htmlFile"
+    echo -n " – $($date -v-"$i"m +"%b %d %Y")" >> "$htmlFile"
+  fi
+  if [ "$i" -eq 0 ]; then
+    echo -e " ending $now${hiOff}  │"
+    echo " ending $now" >> "$htmlFile"
+  else
+    echo -e " ending $(printf "%-10s" $i"mo back")${hiOff} │"
+    echo " ending ${i}mo back" >> "$htmlFile"
+  fi
+done
+
+echo "└────────────────┴─────────────────────┴────────────────────────────────────────┘"
+echo "  </table>" >> "$htmlFile"
+
+avgIssuesClosed=$(($(total=0;
+  for i in "${issuesClosedArray[@]}"; \
+    do ((total+=i)); done; echo $total) / months))
+avgIssuesOpened=$(($(total=0;
+  for i in "${issuesOpenedArray[@]}"; \
+    do ((total+=i)); done; echo $total) / months))
+avgIssuesDelta=$(($(total=0;
+  for i in "${issuesDeltaArray[@]}"; \
+    do ((total+=i)); done; echo $total) / months))
+
+avgPRsMerged=$(($(total=0;
+  for i in "${PRsMergedArray[@]}"; \
+    do ((total+=i)); done; echo $total) / months))
+avgPRsClosed=$(($(total=0;
+  for i in "${PRsClosedArray[@]}"; \
+    do ((total+=i)); done; echo $total) / months))
+avgPRsOpened=$(($(total=0;
+  for i in "${PRsOpenedArray[@]}"; \
+    do ((total+=i)); done; echo $total) / months))
+avgPRsDelta=$(($(total=0;
+  for i in "${PRsDeltaArray[@]}"; \
+    do ((total+=i)); done; echo $total) / months))
+avgPRsDelta=$(($(total=0;
+  for i in "${PRsDeltaArray[@]}"; \
+    do ((total+=i)); done; echo $total) / months))
+
+hi=$hiEscape
+if [ "$months" -gt 1 ]; then
+  echo " For the last $months months:"
+  echo
+  if [ $hasIssues = true ]; then
+  echo -n -e "${hi}"
+  if [ $avgIssuesOpened = 0 ]; then
+    echo -n "$(printf "%8s" $((avgIssuesClosed * 100 / 1)))"
+  else
+    echo -n "$(printf "%8s" $((avgIssuesClosed * 100 / avgIssuesOpened)))"
+  fi
+  echo -n -e " percent net closure rate for issues"
+  echo " (issues resolved during this time period vs issues opened)."
+  fi
+  echo -n -e "${hiOff}"
+  if [ $avgPRsOpened = 0 ]; then
+    echo -n "$(printf "%8s" \
+      $(((avgPRsMerged + avgPRsClosed) * 100 / 1 )))"
+  else
+    echo -n "$(printf "%8s" \
+      $(((avgPRsMerged + avgPRsClosed) * 100 / avgPRsOpened )))"
+  fi
+  echo -n " percent net closure rate for PRs"
+  echo " (PRs merged/closed during this time period vs PRs opened)."
+
+  if [ $hasIssues = true ]; then
+  echo
+  echo -n -e "${hi}$(printf "%8s" $avgIssuesClosed)"
+  echo " issues closed per month on average."
+  echo -n -e "${hiOff}"
+
+  echo -n "$(printf "%8s" $avgIssuesOpened)"
+  echo " issues opened per month on average."
+  increaseOrDecrease="increase"
+  [[ $avgIssuesDelta -lt 0 ]] && increaseOrDecrease="decrease"
+  [[ $avgIssuesDelta -gt 0 ]] && avgIssuesDelta="+$avgIssuesDelta"
+  echo -n -e "${hi}$(printf "%8s" $avgIssuesDelta)"
+  echo " issue $increaseOrDecrease in open issues per month on average."
+  echo -n -e "${hiOff}"
+  fi
+
+  PRtoCommitPercentage=0
+  [ "$avgCommits" -gt 0 ] && PRtoCommitPercentage="$(echo \
+    "$(echo "$avgPRsMerged / $avgCommits" | bc -l) \
+    * 100 / 1" | bc)"
+
+  echo
+  echo -n -e "${hi}"
+  echo -n "$(printf "%8s" $avgPRsMerged)"
+  echo " PRs merged per month on average."
+  echo -n -e "${hiOff}"
+  echo -n "$(printf "%8s" "$PRtoCommitPercentage")"
+  echo " percent merged PRs / commits ratio"
+  echo -n "         (average $avgPRsMerged merged PRs"
+  echo " vs average $avgCommits commits)."
+  echo -n "$(printf "%8s" $avgPRsClosed)"
+  echo " PRs closed (unmerged) per month on average."
+  echo -n -e "${hi}"
+  echo -n "$(printf "%8s" $avgPRsOpened)"
+  echo " PRs opened per month on average."
+  echo -n -e "${hiOff}"
+  increaseOrDecrease="increase"
+  [[ $avgPRsDelta -lt 0 ]] && increaseOrDecrease="decrease"
+  [[ $avgPRsDelta -gt 0 ]] && avgPRsDelta="+$avgPRsDelta"
+  echo -n -e "$(printf "%8s" $avgPRsDelta)"
+  echo -e " PR $increaseOrDecrease in open PRs per month on average."
+fi
+
+# Issue averages
+totalIssuesOpened=$(total=0;
+  for i in "${issuesOpenedArray[@]}"; \
+    do ((total+=i)); done; echo $total)
+totalIssuesClosed=$(total=0;
+  for i in "${issuesClosedArray[@]}"; \
+    do ((total+=i)); done; echo $total)
+
+echo
+
+if [ "$months" -gt 1 ]; then
+  netIssuesOpened=$((totalIssuesOpened - totalIssuesClosed))
+
+  if [ $hasIssues = true ]; then
+  echo -n -e "${hi}"
+  increaseOrDecrease="increase"
+  [[ $netIssuesOpened -lt 0 ]] && increaseOrDecrease="decrease"
+  [[ $netIssuesOpened -gt 0 ]] && netIssuesOpened="+$netIssuesOpened"
+  echo -n -e "$(printf "%8s" $netIssuesOpened) issue"
+  echo -n -e " $increaseOrDecrease"
+  echo -e " in open issues overall."
+fi
+fi
+echo -ne "${hiOff}"
+
+# PR averages
+totalPRsClosed=$(total=0;
+  for i in "${PRsClosedArray[@]}"; \
+    do ((total+=i)); done; echo $total)
+totalPRsMerged=$(total=0;
+  for i in "${PRsMergedArray[@]}"; \
+    do ((total+=i)); done; echo $total)
+totalPRsOpened=$(total=0;
+  for i in "${PRsOpenedArray[@]}"; \
+    do ((total+=i)); done; echo $total)
+
+if [ "$months" -gt 1 ]; then
+  netPRsOpened=$((totalPRsOpened - totalPRsMerged - totalPRsClosed))
+
+  increaseOrDecrease="increase"
+  [[ $netPRsOpened -lt 0 ]] && increaseOrDecrease="decrease"
+  [[ $netPRsOpened -gt 0 ]] && netPRsOpened="+$netPRsOpened"
+  echo -n -e "$(printf "%8s" "$netPRsOpened") PR"
+  increaseOrDecrease="increase"
+  if [[ $netPRsOpened -lt 0 ]]; then
+    increaseOrDecrease="decrease"
+  fi
+  echo -n -e " $increaseOrDecrease"
+  echo -e " in open PRs overall."
+fi
+
+echo
+echo " ────────────────────────────────────────────────────────────────────────────"
+echo
+
+if [ $hasGnuplot = true ]; then
+  if [ $hasIssues = true ]; then
+    writeDualAxisGraphToHTMLFile \
+      "Increase/decrease in open issues/PRs" \
+      "Increase/decrease in open PRs" \
+      "Increase/decrease in open issues" \
+      "dark-salmon" "forest-green" \
+      "increase_decrease" \
+      "${PRsDeltaArray[@]}" "e" "${issuesDeltaArray[@]}"
+  else
+    writeGraphToHTMLFile \
+      "Increase/decrease in open PRs" \
+      "Increase/decrease in open PRs" \
+      "increase_decrease" \
+      "${PRsDeltaArray[@]}"
+  fi
+fi
+
+# Issues summary section
+
+cat << EOF >> "$htmlFile"
+  <div class="months_summary" id="issues-and-prs-months-summary">
+  <h4><a href="#issues-and-prs-months-summary"><span>🔗</span>
+    For the last $months months:</a></h4>
+EOF
+
+issuesClosedPercentage=0
+issuesPercentItem=""
+if [ $hasIssues = true ]; then
+  if [ $avgIssuesOpened = 0 ]; then
+    issuesClosedPercentage=$((avgIssuesClosed * 100 / 1))
+  else
+    issuesClosedPercentage=$((avgIssuesClosed * 100 / avgIssuesOpened))
+  fi
+  issuesPercentItem="\
+      <li>$issuesClosedPercentage
+       percent net closure rate for issues (issues resolved during this
+       time period vs issues opened)."
+fi
+if [ $avgPRsOpened = 0 ]; then
+  PRsMergedOrClosedPercentage=$((( \
+    avgPRsMerged + avgPRsClosed) * 100 / 1))
+else
+  PRsMergedOrClosedPercentage=$((( \
+    avgPRsMerged + avgPRsClosed) * 100 / avgPRsOpened ))
+fi
+cat << EOF >> "$htmlFile"
+    <ul>
+      $issuesPercentItem
+      <li>$PRsMergedOrClosedPercentage
+       percent net closure rate for PRs (PRs merged/closed during this time
+       period vs PRs opened).
+    </ul>
+EOF
+
+if [ $hasIssues = true ]; then
+cat << EOF >> "$htmlFile"
+    <ul>
+      <li>$avgIssuesClosed issues closed per month on average.
+      <li>$avgIssuesOpened issues opened per month on average.
+EOF
+increaseOrDecrease="increase"
+if [[ $avgIssuesDelta -lt 0 ]]; then
+  increaseOrDecrease="decrease"
+fi
+cat << EOF >> "$htmlFile"
+      <li>$avgIssuesDelta issue $increaseOrDecrease in open issues per
+          month on average.
+    </ul>
+EOF
+fi
+
+cat << EOF >> "$htmlFile"
+    <ul>
+      <li>$avgPRsMerged PRs merged per month on average.
+      <li>$PRtoCommitPercentage percent merged PRs / commits ratio
+          (avg. $avgPRsMerged merged PRs vs avg. $avgCommits commits).
+      <li>$avgPRsClosed PRs closed (unmerged) per month on average.
+      <li>$avgPRsOpened PRs opened per month on average.
+EOF
+increaseOrDecrease="increase"
+if [[ $avgPRsDelta -lt 0 ]]; then
+  increaseOrDecrease="decrease"
+fi
+cat << EOF >> "$htmlFile"
+      <li>$avgPRsDelta PR $increaseOrDecrease in open PRs per
+          month on average.
+    </ul>
+    <ul>
+EOF
+
+if [ $hasIssues = true ]; then
+increaseOrDecrease="increase"
+[[ $netIssuesOpened -lt 0 ]] && increaseOrDecrease="decrease"
+
+cat << EOF >> "$htmlFile"
+      <li>$netIssuesOpened issue $increaseOrDecrease
+      in open issues overall.
+EOF
+fi
+
+increaseOrDecrease="increase"
+[[ $netPRsOpened -lt 0 ]] && increaseOrDecrease="decrease"
+increaseOrDecrease="increase"
+if [[ $netPRsOpened -lt 0 ]]; then
+  increaseOrDecrease="decrease"
+fi
+
+cat << EOF >> "$htmlFile"
+    <li>$netPRsOpened PR $increaseOrDecrease
+    in open PRs overall.
+  </ul>
+</div> <!-- end of issues summary section -->
+</div><!-- end of issues upper container -->
+EOF
+
+if [ $hasGnuplot = true ]; then
+
+if [ $hasIssues = true ]; then
+  writeDualAxisGraphToHTMLFile \
+    "Issues closed and opened" \
+    "Issues opened" \
+    "Issues closed" \
+    "orange" "web-blue" \
+    "issues_closed_opened" \
+    "${issuesOpenedArray[@]}" "e" "${issuesClosedArray[@]}"
+fi
+
+  writeDualAxisGraphToHTMLFile \
+    "PRs merged/closed and opened" \
+    "PRs opened" \
+    "PRs merged+closed" \
+    "light-red" "dark-violet" \
+    "PRs_merged_closed_opened" \
+    "${PRsOpenedArray[@]}" "e" "${PRsMergedOrClosedArray[@]}"
+
+  [[ $interactive = true ]] && read -rsp \
+    $'Press any key to view issue/PR graphs...\n' -n1 \
+  && tput cuu1 && tput el; echo
+
+if [ $hasIssues = true ]; then
+  showDualAxisGraphInTerminal "Increase/decrease in open issues/PRs" \
+    "Increase/decrease in open PRs" "Increase/decrease in open issues" \
+     "dark-salmon" "forest-green" \
+    "${PRsDeltaArray[@]}" "e" "${issuesDeltaArray[@]}"
+  else
+  showGraphInTerminal "Increase/decrease in open PRs" \
+    "Increase/decrease in open PRs" "${PRsDeltaArray[@]}"
+fi
+
+if [ $hasIssues = true ]; then
+  [[ $interactive = true ]] && read -rsp \
+    $'Press any key to see next issue/PR graph...\n' -n1 \
+  && tput cuu1 && tput el; echo
+  showDualAxisGraphInTerminal "Issues closed and opened" \
+    "Issues opened" "Issues closed" \
+    "orange" "medium-blue" \
+    "${issuesOpenedArray[@]}" "e" "${issuesClosedArray[@]}"
+fi
+
+  [[ $interactive = true ]] && read -rsp \
+    $'Press any key to see final issue/PR graph...\n' -n1 \
+  && tput cuu1 && tput el; echo
+  showDualAxisGraphInTerminal "PRs merged+closed and opened" \
+    "PRs opened" "PRs merged+closed" \
+    "light-red" "dark-violet" \
+    "${PRsOpenedArray[@]}" "e" "${PRsMergedOrClosedArray[@]}"
+
+fi
+issuesOpenStats=""
+if [ $hasIssues = true ]; then
+
+echo
+echo " ────────────────────────────────────────────────────────────────────────────"
+echo
+
+tput sc
+echo -n "☕️ Getting count of open issues"
+
+sleep $((sleepseconds / 3))
+echo -n "."
+sleep $((sleepseconds / 3))
+echo -n "."
+
+issuesCurrentlyOpenQuery='type:issue+state:open+created:%3C='"$realdateYmd"''
+issuesCurrentlyOpenResults=$(curl -i \
+  $CURLOPTS -H "$authorizationHeader" -fsSL \
+  "$searchBase+$issuesCurrentlyOpenQuery&per_page=100")
+echo -n "."
+issuesCurrentlyOpen="$(echo "$issuesCurrentlyOpenResults" \
+  | grep '^  "total_count"' | cut -d ':' -f2- | sed 's/,//' | xargs)"
+
+# erase coffee line
+tput rc && tput el
+
+echo -n -e "${hi}"
+echo -n -e "$(printf "%8s" "$issuesCurrentlyOpen") issues were open"
+echo -e " as of $realdate."
+echo -n -e "${hiOff}"
+echo -n -e "$(printf "%8s" \
+  "$(divide "$issuesCurrentlyOpen" "$avgIssuesOpened")")"
+echo -n -e " times as many issues currently open as the average number"
+echo -e " of issues"
+echo -e "         opened per month."
+
+echo
+echo "  $linkBase+$issuesCurrentlyOpenQuery"
+echo
+
+if [ "$issuesCurrentlyOpen" != 0 ]; then
+issuesCurrentlyOpenPageCount=$(echo "$issuesCurrentlyOpenResults" \
+  | grep -i "^link:" | cut -d ";" -f2 | cut -d "=" -f5 | sed 's/>//')
+
+tput sc
+if [ "$issuesCurrentlyOpen" -lt 1000 ]; then
+  echo -n "☕️ Getting data for all $issuesCurrentlyOpen open issues"
+else
+  echo -n "☕️ Getting data for latest 1000 open issues"
+fi
+
+if [ -n "$issuesCurrentlyOpenPageCount" ]; then
+  for i in $(seq 2 "$issuesCurrentlyOpenPageCount"); do
+    echo -n "."
+    issuesCurrentlyOpenResults+=$(curl \
+      $CURLOPTS -H "$authorizationHeader" -fsSL \
+      "$searchBase+$issuesCurrentlyOpenQuery&sort=updated&per_page=100&page=$i")
+  done
+fi
+
+issuesCurrentlyOpenDates=$(echo "$issuesCurrentlyOpenResults" \
+  | grep '^      "created_at"' | cut -d'"' -f4)
+
+issueDaysCount=0
+issuesOpenRawDaysArray=()
+for issueDate in $issuesCurrentlyOpenDates; do
+  if ((issueDaysCount % 300 == 0)); then
+    echo -n "."
+  fi
+  ((issueDaysCount++))
+  days=$(getDaysBetweenTwoDates "$nowIso8601" "$issueDate")
+  issuesOpenRawDaysArray+=("$days")
+done
+
+# erase coffee line
+tput rc && tput el
+
+issuesCurrentlyOpenByMonth=$(echo "$issuesCurrentlyOpenDates" \
+  | cut -d "-" -f1-2 | sort | uniq -c | sed -E 's/^ *([^ ]+) (.+)/\2 \1/')
+
+echo
+if [ "$issuesCurrentlyOpen" -lt 1000 ]; then
+  [[ $interactive = true ]] && read -rsp \
+    "Press any key to view distribution of all $issuesCurrentlyOpen open \
+issues by month created..."$'\n' -n1
+else
+  [[ $interactive = true ]] && read -rsp \
+    "Press any key to view distribution of latest 1000 open \
+issues by month created..."$'\n' -n1
+fi
+tput cuu1 && tput el
+
+echo
+if [ $hasGnuplot = true ]; then
+  title="Open issues"
+  [ "$issuesCurrentlyOpen" -ge 1000 ] && title="Latest 1000 open issues"
+  showBoxChartInTerminal "$title" "Month created" \
+    "Number of issues still open" "orange" "#444444"\
+    "$issuesCurrentlyOpenByMonth"
+else
+  if [ "$issuesCurrentlyOpen" -ge 1000 ]; then
+    echo "     Latest 1000"
+    echo "     open issues"
+  fi
+  echo "┌─────────┬────────┐"
+  echo "│  Month  │ Issues │"
+  echo "│ created │  open  │"
+  echo "├─────────┼────────┤"
+  while IFS= read -r line; do
+    echo -n "│ "
+    echo -n "$(echo "$line" | cut -d ' ' -f1)"
+    echo -n " │ "
+    echo -n "$(printf "%6s" "$(echo "$line" | cut -d ' ' -f2)")"
+    echo " │"
+  done <<< "$issuesCurrentlyOpenByMonth"
+  echo "└─────────┴────────┘"
+fi
+
+echo
+if [ $hasGnuplot = true ]; then
+  if [ -n "${issuesOpenRawDaysArray[*]}" ]; then
+    if [ "$issuesCurrentlyOpen" -lt 1000 ]; then
+      echo "                   Age statistics for all open issues"
+    else
+      echo "              Age statistics for latest 1000 open issues"
+    fi
+    showStatsInTerminal "Newest" "Oldest" \
+      "$(printf '%s\n' "${issuesOpenRawDaysArray[@]}" | sort -n)"
+    read -r -d '' issuesOpenStats <<EOF
+  "issues_open_age_days_stats": {
+    "records": $records,
+    "newest": $minimum,
+    "percentile_25": $firstQu,
+    "median": $median,
+    "mean": $mean,
+    "percentile_75": $thirdQu,
+    "percentile_90": $days90th,
+    "oldest": $maximum,
+    "std_dev": $stdDev
+  },
+EOF
+  fi
+else
+  echo -n "To see detailed statistics for open issues"
+  echo " install gnuplot; e.g., with";
+  echo "'apt install gnuplot' (Ubuntu) or 'brew install gnuplot' (macOS).";
+fi
+fi
+fi
+
+PRsOpenStats=""
+echo
+echo " ────────────────────────────────────────────────────────────────────────────"
+echo
+
+tput sc
+echo -n "☕️ Getting count of open PRs"
+
+PRsCurrentlyOpenQuery='type:pr+state:open+created:%3C='"$realdateYmd"''
+PRsCurrentlyOpenResults=$(curl -i \
+  $CURLOPTS -H "$authorizationHeader" -fsSL \
+  "$searchBase+$PRsCurrentlyOpenQuery&per_page=100")
+echo -n "."
+
+PRsCurrentlyOpen="$(echo "$PRsCurrentlyOpenResults" \
+  | grep '^  "total_count"' | cut -d ':' -f2- | sed 's/,//' | xargs)"
+PRsCurrentlyOpenPageCount=$(echo "$PRsCurrentlyOpenResults" \
+  | grep -i "^link:" | cut -d ";" -f2 | cut -d "=" -f5 | sed 's/>//')
+
+# erase coffee line
+tput rc && tput el
+
+echo -n -e "${hi}"
+echo -n -e "$(printf "%8s" "$PRsCurrentlyOpen") PRs were open"
+echo -e " as of $realdate."
+echo -n -e "${hiOff}"
+echo -n -e "$(printf "%8s" \
+  "$(divide "$PRsCurrentlyOpen" "$avgPRsOpened")")"
+echo -n -e " times as many PRs currently open as the average number"
+echo -e " of PRs"
+echo -e "         opened per month."
+
+echo
+echo "  $linkBase+$PRsCurrentlyOpenQuery"
+echo
+
+if [ "$PRsCurrentlyOpen" != 0 ]; then
+tput sc
+if [ "$PRsCurrentlyOpen" -lt 1000 ]; then
+  echo -n "☕️ Getting data for all $PRsCurrentlyOpen open PRs"
+else
+  echo -n "☕️ Getting data for latest 1000 open PRs"
+fi
+
+if [ -n "$PRsCurrentlyOpenPageCount" ]; then
+  for i in $(seq 2 "$PRsCurrentlyOpenPageCount"); do
+    echo -n "."
+    PRsCurrentlyOpenResults+=$(curl \
+      $CURLOPTS -H "$authorizationHeader" -fsSL \
+      "$searchBase+$PRsCurrentlyOpenQuery&sort=updated&per_page=100&page=$i")
+  done
+fi
+
+PRsCurrentlyOpenDates=$(echo "$PRsCurrentlyOpenResults" \
+  | grep '^      "created_at"' | cut -d'"' -f4)
+
+PRdaysCount=0
+PRsOpenRawDaysArray=()
+for PRdate in $PRsCurrentlyOpenDates; do
+  if ((PRdaysCount % 300 == 0)); then
+    echo -n "."
+  fi
+  ((PRdaysCount++))
+  days=$(getDaysBetweenTwoDates "$nowIso8601" "$PRdate")
+  PRsOpenRawDaysArray+=("$days")
+done
+
+# erase coffee line
+tput rc && tput el
+
+PRsCurrentlyOpenByMonth=$(echo "$PRsCurrentlyOpenDates" \
+  | cut -d "-" -f1-2 | sort | uniq -c | sed -E 's/^ *([^ ]+) (.+)/\2 \1/')
+
+echo
+if [ "$PRsCurrentlyOpen" -lt 1000 ]; then
+  [[ $interactive = true ]] && read -rsp \
+    "Press any key to view distribution of all $PRsCurrentlyOpen open \
+PRs by month created..."$'\n' -n1
+else
+  [[ $interactive = true ]] && read -rsp \
+    "Press any key to view distribution of latest 1000 open \
+PRs by month created..."$'\n' -n1
+fi
+tput cuu1 && tput el
+
+echo
+if [ $hasGnuplot = true ]; then
+  title="Open PRs"
+  [ "$PRsCurrentlyOpen" -ge 1000 ] && title="Latest 1000 open PRs"
+  showBoxChartInTerminal "$title" "Month created" \
+    "Number of PRs still open" "light-red" "#444444" \
+    "$PRsCurrentlyOpenByMonth"
+else
+  if [ "$PRsCurrentlyOpen" -ge 1000 ]; then
+    echo "     Latest 1000"
+    echo "      open PRs"
+  fi
+  echo "┌─────────┬────────┐"
+  echo "│  Month  │  PRs   │"
+  echo "│ created │  open  │"
+  echo "├─────────┼────────┤"
+  while IFS= read -r line; do
+    echo -n "│ "
+    echo -n "$(echo "$line" | cut -d ' ' -f1)"
+    echo -n " │ "
+    echo -n "$(printf "%6s" "$(echo "$line" | cut -d ' ' -f2)")"
+    echo " │"
+  done <<< "$PRsCurrentlyOpenByMonth"
+  echo "└─────────┴────────┘"
+fi
+
+echo
+if [ $hasGnuplot = true ]; then
+  if [ -n "${PRsOpenRawDaysArray[*]}" ]; then
+    if [ "$PRsCurrentlyOpen" -lt 1000 ]; then
+      echo "                    Age statistics for all open PRs"
+    else
+      echo      "           Age statistics for latest 1000 open PRs"
+    fi
+    showStatsInTerminal "Newest" "Oldest" \
+      "$(printf '%s\n' "${PRsOpenRawDaysArray[@]}" | sort -n)"
+    read -r -d '' PRsOpenStats <<EOF
+  "PRs_open_age_days_stats": {
+    "records": $records,
+    "newest": $minimum,
+    "percentile_25": $firstQu,
+    "median": $median,
+    "mean": $mean,
+    "percentile_75": $thirdQu,
+    "percentile_90": $days90th,
+    "oldest": $maximum,
+    "std_dev": $stdDev
+  },
+EOF
+  fi
+else
+  echo -n "To see detailed statistics for open PRs"
+  echo " install gnuplot; e.g., with";
+  echo "'apt install gnuplot' (Ubuntu) or 'brew install gnuplot' (macOS).";
+fi
+fi
+
+issuesResolvedStats=""
+if [ $hasIssues = true ]; then
+
+echo
+echo " ────────────────────────────────────────────────────────────────────────────"
+echo
+
+tput sc
+echo -n "☕️ Getting count of closed issues"
+
+sleep $((sleepseconds / 3))
+echo -n "."
+sleep $((sleepseconds / 3))
+echo -n "."
+
+issuesClosedQuery='type:issue+state:closed+created:%3C='"$realdateYmd"''
+issuesClosedResults=$(curl -i \
+  $CURLOPTS -H "$authorizationHeader" -fsSL \
+  "$searchBase+$issuesClosedQuery&per_page=100")
+echo -n "."
+issuesClosed="$(echo "$issuesClosedResults" \
+  | grep '^  "total_count"' | cut -d ':' -f2- | sed 's/,//' | xargs)"
+
+# erase coffee line
+tput rc && tput el
+
+echo -n -e "${hi}"
+echo -n -e "$(printf "%8s" "$issuesClosed") closed issues"
+echo -e " as of $realdate."
+echo -n -e "${hiOff}"
+
+echo -n -e "$(printf "%8s" \
+  "$(divide "$issuesClosed" "$issuesCurrentlyOpen")")"
+echo -e " times as many closed issues as open issues."
+
+closedIssuesToCommitsPercentage="$(echo \
+    "$(echo "$issuesClosed" / "$totalCommits" | bc -l) \
+    * 100 / 1" | bc)"
+
+echo -n -e "$(printf "%8s" "$closedIssuesToCommitsPercentage")"
+echo -e " percent ratio of total closed issues to total commits."
+
+echo
+echo "  $linkBase+$issuesClosedQuery"
+echo
+
+if [ "$issuesClosed" != 0 ]; then
+issuesClosedPageCount=$(echo "$issuesClosedResults" \
+  | grep -i "^link:" | cut -d ";" -f2 | cut -d "=" -f5 | sed 's/>//')
+
+if [ "$issuesClosed" -lt 1000 ]; then
+  echo -n "☕️ Getting data for all $issuesClosed closed issues"
+else
+  echo -n "☕️ Getting data for latest 1000 closed issues"
+fi
+
+if [ -n "$issuesClosedPageCount" ]; then
+  for i in $(seq 2 "$issuesClosedPageCount"); do
+    echo -n "."
+    issuesClosedResults+=$(curl \
+      $CURLOPTS -H "$authorizationHeader" -fsSL \
+      "$searchBase+$issuesClosedQuery&sort=updated&per_page=100&page=$i")
+  done
+fi
+
+issuesClosedCreationDates=$(echo "$issuesClosedResults" \
+  | grep '^      "created_at"' | cut -d'"' -f4)
+
+issuesClosedCloseDates=$(echo "$issuesClosedResults" \
+  | grep '^      "closed_at":' | cut -d'"' -f4)
+
+issuesClosedDatePairs=\
+$(paste <(echo "$issuesClosedCloseDates") \
+  <(echo "$issuesClosedCreationDates"))
+
+issueDatesCount=0
+issuesClosedRawDaysArray=()
+while IFS= read -r line; do
+  if ((issueDatesCount % 300 == 0)); then
+    echo -n "."
+  fi
+  ((issueDatesCount++))
+  closeDate=$(echo "$line" | cut -f1)
+  creationDate=$(echo "$line" | cut -f2)
+  daysToClose=$(getDaysBetweenTwoDates "$closeDate" "$creationDate")
+  issuesClosedRawDaysArray+=("$daysToClose")
+done <<< "$issuesClosedDatePairs"
+
+# erase coffee line
+tput rc && tput el
+
+issuesClosedByMonth=$(echo "$issuesClosedCloseDates" \
+  | cut -d "-" -f1-2 | sort | uniq -c | sed -E 's/^ *([^ ]+) (.+)/\2 \1/')
+
+echo
+if [ "$issuesClosed" -lt 1000 ]; then
+  [[ $interactive = true ]] && read -rsp \
+    "Press any key to view distribution of all $issuesClosed closed \
+issues by month created..."$'\n' -n1
+else
+[[ $interactive = true ]] && read -rsp \
+    "Press any key to view distribution of latest 1000 closed \
+issues by month created..."$'\n' -n1
+fi
+tput cuu1 && tput el
+
+echo
+if [ $hasGnuplot = true ]; then
+  title="Issues closed"
+  [ "$issuesClosed" -ge 1000 ] && title="Latest 1000 issues closed"
+  showBoxChartInTerminal "$title" "Month created" \
+    "Number of issues closed" "forest-green" "#444444"\
+    "$issuesClosedByMonth"
+else
+  if [ "$issuesClosed" -ge 1000 ]; then
+    echo "     Latest 1000"
+    echo "    issues closed"
+  fi
+  echo "┌─────────┬────────┐"
+  echo "│  Month  │ Issues │"
+  echo "│  closed │ closed │"
+  echo "├─────────┼────────┤"
+  while IFS= read -r line; do
+    echo -n "│ "
+    echo -n "$(echo "$line" | cut -d ' ' -f1)"
+    echo -n " │ "
+    echo -n "$(printf "%6s" "$(echo "$line" | cut -d ' ' -f2)")"
+    echo " │"
+  done <<< "$issuesClosedByMonth"
+  echo "└─────────┴────────┘"
+fi
+
+echo
+if [ $hasGnuplot = true ]; then
+  if [ -n "${issuesClosedRawDaysArray[*]}" ]; then
+    if [ "$issuesClosed" -lt 1000 ]; then
+      echo "             Time-to-close statistics for all closed issues"
+    else
+      echo "         Time-to-close statistics for latest 1000 closed issues"
+    fi
+    showStatsInTerminal "Fastest" "Longest" \
+      "$(printf '%s\n' "${issuesClosedRawDaysArray[@]}" | sort -n)" ""
+    read -r -d '' issuesResolvedStats <<EOF
+  "issues_time_to_resolve_days_stats": {
+    "records": $records,
+    "fastest": $minimum,
+    "percentile_25": $firstQu,
+    "median": $median,
+    "mean": $mean,
+    "percentile_75": $thirdQu,
+    "percentile_90": $days90th,
+    "longest": $maximum,
+    "std_dev": $stdDev
+  },
+EOF
+  fi
+else
+  echo -n "To see detailed statistics for closed issues"
+  echo " install gnuplot; e.g., with";
+  echo "'apt install gnuplot' (Ubuntu) or 'brew install gnuplot' (macOS).";
+fi
+fi
+fi
+
+PRsResolvedStats=""
+echo
+echo " ────────────────────────────────────────────────────────────────────────────"
+echo
+
+tput sc
+echo -n "☕️ Getting count of merged/closed PRs"
+
+sleep $((sleepseconds / 3))
+echo -n "."
+sleep $((sleepseconds / 3))
+echo -n "."
+
+PRsClosedQuery='type:pr+state:closed+created:%3C='"$realdateYmd"''
+PRsClosedResults=$(curl -i \
+  $CURLOPTS -H "$authorizationHeader" -fsSL \
+  "$searchBase+$PRsClosedQuery&per_page=100")
+echo -n "."
+PRsClosed="$(echo "$PRsClosedResults" \
+  | grep '^  "total_count"' | cut -d ':' -f2- | sed 's/,//' | xargs)"
+
+# erase coffee line
+tput rc && tput el
+
+echo -n -e "${hi}"
+echo -n -e "$(printf "%8s" "$PRsClosed") merged/closed PRs"
+echo -e " as of $realdate."
+echo -n -e "${hiOff}"
+echo -n -e "$(printf "%8s" \
+  "$(divide "$PRsClosed" "$PRsCurrentlyOpen")")"
+echo -e " times as many closed PRs as open PRs."
+
+echo
+echo "  $linkBase+$PRsClosedQuery"
+echo
+
+if [ "$PRsClosed" != 0 ]; then
+PRsClosedPageCount=$(echo "$PRsClosedResults" \
+  | grep -i "^link:" | cut -d ";" -f2 | cut -d "=" -f5 | sed 's/>//')
+
+if [ "$PRsClosed" -lt 1000 ]; then
+  echo -n "☕️ Getting data for all $PRsClosed merged/closed PRs"
+else
+  echo -n "☕️ Getting data for latest 1000 merged/closed PRs"
+fi
+
+if [ -n "$PRsClosedPageCount" ]; then
+  for i in $(seq 2 "$PRsClosedPageCount"); do
+    echo -n "."
+    PRsClosedResults+=$(curl \
+      $CURLOPTS -H "$authorizationHeader" -fsSL \
+      "$searchBase+$PRsClosedQuery&sort=updated&per_page=100&page=$i")
+    done
+fi
+
+PRsClosedCreationDates=$(echo "$PRsClosedResults" \
+  | grep '^      "created_at"' | cut -d'"' -f4)
+
+PRsClosedCloseDates=$(echo "$PRsClosedResults" \
+  | grep '^      "closed_at":' | cut -d'"' -f4)
+
+PRsClosedDatePairs=\
+$(paste <(echo "$PRsClosedCloseDates") \
+  <(echo "$PRsClosedCreationDates"))
+
+PRDatesCount=0
+PRsClosedRawDaysArray=()
+while IFS= read -r line; do
+  if ((PRDatesCount % 300 == 0)); then
+    echo -n "."
+  fi
+  ((PRDatesCount++))
+  closeDate=$(echo "$line" | cut -f1)
+  creationDate=$(echo "$line" | cut -f2)
+  daysToClose=$(getDaysBetweenTwoDates "$closeDate" "$creationDate")
+  PRsClosedRawDaysArray+=("$daysToClose")
+done <<< "$PRsClosedDatePairs"
+
+# erase coffee line
+tput rc && tput el
+
+PRsClosedByMonth=$(echo "$PRsClosedCloseDates" \
+  | cut -d "-" -f1-2 | sort | uniq -c | sed -E 's/^ *([^ ]+) (.+)/\2 \1/')
+
+echo
+if [ "$PRsClosed" -lt 1000 ]; then
+  [[ $interactive = true ]] && read -rsp \
+    "Press any key to view distribution of all $PRsClosed merged/closed \
+PRs by month created..."$'\n' -n1
+else
+[[ $interactive = true ]] && read -rsp \
+    "Press any key to view distribution of latest 1000 merged/closed \
+PRs by month created..."$'\n' -n1
+fi
+tput cuu1 && tput el
+
+echo
+if [ $hasGnuplot = true ]; then
+  title="PRs merged/closed"
+  [ "$PRsClosed" -ge 1000 ] && title="Latest 1000 PRs merged/closed"
+  showBoxChartInTerminal "$title" "Month created" \
+    "Number of PRs merged/closed" "navy-blue" "white"\
+    "$PRsClosedByMonth"
+else
+  if [ "$PRsClosed" -ge 1000 ]; then
+    echo "    Latest 1000 PRs"
+    echo "    merged/closed"
+  fi
+  echo "┌──────────┬─────────┐"
+  echo "│  Month   │  PRs    │"
+  echo "│  merged/ │ merged/ │"
+  echo "│  closed  │ closed  │"
+  echo "├──────────┼─────────┤"
+  while IFS= read -r line; do
+    echo -n "│  "
+    echo -n "$(echo "$line" | cut -d ' ' -f1)"
+    echo -n " │ "
+    echo -n "$(printf "%7s" "$(echo "$line" | cut -d ' ' -f2)")"
+    echo " │"
+  done <<< "$PRsClosedByMonth"
+  echo "└──────────┴─────────┘"
+fi
+
+echo
+if [ $hasGnuplot = true ]; then
+  if [ -n "${PRsClosedRawDaysArray[*]}" ]; then
+    if [ "$PRsClosed" -lt 1000 ]; then
+      echo "            Time-to-close statistics for all merged/closed PRs"
+    else
+      echo "       Time-to-close statistics for latest 1000 merged/closed PRs"
+    fi
+    showStatsInTerminal "Fastest" "Longest" \
+      "$(printf '%s\n' "${PRsClosedRawDaysArray[@]}" | sort -n)"
+    read -r -d '' PRsResolvedStats <<EOF
+  "PRs_time_to_resolve_days_stats": {
+    "records": $records,
+    "fastest": $minimum,
+    "percentile_25": $firstQu,
+    "median": $median,
+    "mean": $mean,
+    "percentile_75": $thirdQu,
+    "percentile_90": $days90th,
+    "longest": $maximum,
+    "std_dev": $stdDev
+  },
+EOF
+  fi
+else
+  echo -n "To see detailed statistics for merged/closed PRs"
+  echo " install gnuplot; e.g., with";
+  echo "'apt install gnuplot' (Ubuntu) or 'brew install gnuplot' (macOS).";
+fi
+fi
+
+echo
+echo " ────────────────────────────────────────────────────────────────────────────"
+echo
+
+echo "<div>" >>  "$htmlFile"
+
+# HTML open issues ###################################################
+
+if [ $hasIssues = true ]; then
+if [ "$issuesCurrentlyOpen" != 0 ]; then
+cat << EOF >> "$htmlFile"
+    <div class="bargraph">
+    <h3 id="open-issues"><a href="#open-issues"><span>🔗</span>
+      Open issues</a></h3>
+    <p>
+    <a href="$linkBase+$issuesCurrentlyOpenQuery">$issuesCurrentlyOpen
+    issues</a> were open as of $realdate
+    <p>$(divide "$issuesCurrentlyOpen" "$avgIssuesOpened") times as many
+    issues currently open as the<br>
+    average number of issues opened per month.
+    <p>$(divide "$issuesClosed" "$issuesCurrentlyOpen") times as many
+    closed issues as open issues.
+    <p class="svg">
+EOF
+
+issuesCurrentlyOpenQueryBase='type:issue+state:open+created'
+
+if [ $hasGnuplot = true ]; then
+  title=""
+  [ "$issuesCurrentlyOpen" -ge 1000 ] && title="Latest 1000 open issues"
+  writeBoxChartToHTMLFile "$title" "Month created" \
+    "Number of issues still open" "orange" "#444444"\
+    "$linkBase+$issuesCurrentlyOpenQueryBase" \
+    "$issuesCurrentlyOpenByMonth"
+else
+  if [ "$issuesCurrentlyOpen" -ge 1000 ]; then
+    caption="Latest 1000<br>open issues"
+  fi
+
+  cat << EOF >> "$htmlFile"
+    <table class="simple">
+      <caption>$caption
+      <thead>
+        <tr>
+          <th>Month<br>created
+          <th>Open<br>issues
+      </thead>
+EOF
+
+  while IFS= read -r line; do
+    date=$(echo -n "$line" | cut -d " " -f1)
+    count=$(echo -n "$line" | cut -d " " -f2)
+    href="$linkBase+$issuesCurrentlyOpenQueryBase:$date"
+  cat << EOF >> "$htmlFile"
+      <tr>
+        <td>$date
+        <td><a href="$href">$count</a>
+EOF
+  done <<< "$issuesCurrentlyOpenByMonth"
+  cat << EOF >> "$htmlFile"
+    </table>
+EOF
+fi
+
+if [ $hasGnuplot = true ]; then
+  if [ -n "${issuesOpenRawDaysArray[*]}" ]; then
+    if [ "$issuesCurrentlyOpen" -lt 1000 ]; then
+      heading="Age statistics for all open issues"
+    else
+      heading="Age statistics for latest 1000 open issues"
+    fi
+    writeStatsToHTMLFile "Newest" "Oldest" "open-issues-age-stats" \
+        "$(printf '%s\n' "${issuesOpenRawDaysArray[@]}" | sort -n)"
+  fi
+fi
+echo "  </div>" >> "$htmlFile"
+fi
+fi
+
+# HTML open PRs ######################################################
+
+if [ "$PRsCurrentlyOpen" != 0 ]; then
+cat << EOF >> "$htmlFile"
+    <div class="bargraph">
+    <h3 id="open-prs"><a href="#open-prs"><span>🔗</span>
+      Open PRs</a></h3>
+    <p>
+    <a href="$linkBase+$PRsCurrentlyOpenQuery">$PRsCurrentlyOpen PRs</a>
+    were open as of $realdate
+    <p>$(divide "$PRsCurrentlyOpen" "$avgPRsOpened") times as many
+    PRs currently open as the<br>
+    average number of PRs opened per month.
+    <p>$(divide "$PRsClosed" "$PRsCurrentlyOpen") times as many
+    closed PRs as open PRs.
+    <p class="svg">
+EOF
+
+PRsCurrentlyOpenQueryBase='type:pr+state:open+created'
+
+if [ $hasGnuplot = true ]; then
+  title=""
+  [ "$PRsCurrentlyOpen" -ge 1000 ] && title="Latest 1000 open PRs"
+  writeBoxChartToHTMLFile "$title" "Month created" \
+    "Number of PRs still open" "light-red" "#444444"\
+    "$linkBase+$PRsCurrentlyOpenQueryBase" \
+    "$PRsCurrentlyOpenByMonth"
+else
+  if [ "$PRsCurrentlyOpen" -ge 1000 ]; then
+    caption="Latest 1000<br>open PRs"
+  fi
+
+  cat << EOF >> "$htmlFile"
+    <table class="simple">
+      <caption>$caption
+      <thead>
+        <tr>
+          <th>Month<br>created
+          <th>Open<br>PRs
+      </thead>
+EOF
+
+  while IFS= read -r line; do
+    date=$(echo -n "$line" | cut -d " " -f1)
+    count=$(echo -n "$line" | cut -d " " -f2)
+    href="$linkBase+$PRsCurrentlyOpenQueryBase:$date"
+  cat << EOF >> "$htmlFile"
+      <tr>
+        <td>$date
+        <td><a href="$href">$count</a>
+EOF
+  done <<< "$PRsCurrentlyOpenByMonth"
+  cat << EOF >> "$htmlFile"
+    </table>
+EOF
+fi
+
+if [ $hasGnuplot = true ]; then
+  if [ -n "${PRsOpenRawDaysArray[*]}" ]; then
+    if [ "$PRsCurrentlyOpen" -lt 1000 ]; then
+      heading="Age statistics for all open PRs"
+    else
+      heading="Age statistics for latest 1000 open PRs"
+    fi
+    writeStatsToHTMLFile "Newest" "Oldest" "open-prs-age-stats" \
+      "$(printf '%s\n' "${PRsOpenRawDaysArray[@]}" | sort -n)"
+  fi
+fi
+echo "  </div>" >> "$htmlFile"
+fi
+
+# HTML closed issues #################################################
+
+if [ $hasIssues = true ]; then
+if [ "$issuesClosed" != 0 ]; then
+cat << EOF >> "$htmlFile"
+    <div class="bargraph">
+    <h3 id="issues-resolved"><a href="#issues-resolved"><span>🔗</span>
+      Issues resolved</a></h3>
+    <p>
+    <a href="$linkBase+$issuesClosedQuery">$issuesClosed issues</a>
+    were closed as of $realdate
+    <p>$(divide "$issuesClosed" "$issuesCurrentlyOpen") times as many
+    closed issues as open issues.
+    <p>$closedIssuesToCommitsPercentage percent ratio of total closed
+    issues to total commits.
+    <p class="svg">
+EOF
+
+issuesClosedQueryBase='type:issue+state:closed+created'
+
+if [ $hasGnuplot = true ]; then
+  title=""
+  [ "$issuesClosed" -ge 1000 ] && title="Latest 1000 closed issues"
+  writeBoxChartToHTMLFile "$title" "Month created" \
+    "Number of issues closed" "forest-green" "white"\
+    "$linkBase+$issuesClosedQueryBase" \
+    "$issuesClosedByMonth"
+else
+  if [ "$issuesClosed" -ge 1000 ]; then
+    caption="Latest 1000<br>closed issues"
+  fi
+  cat << EOF >> "$htmlFile"
+    <table class="simple">
+      <caption>$caption
+      <thead>
+        <tr>
+          <th>Month<br>closed
+          <th>Closed<br>issues
+      </thead>
+EOF
+  while IFS= read -r line; do
+    date=$(echo -n "$line" | cut -d " " -f1)
+    count=$(echo -n "$line" | cut -d " " -f2)
+  cat << EOF >> "$htmlFile"
+      <tr>
+        <td>$date
+        <td>$count
+EOF
+  done <<< "$issuesClosedByMonth"
+  cat << EOF >> "$htmlFile"
+    </table>
+EOF
+fi
+
+if [ $hasGnuplot = true ]; then
+  if [ -n "${issuesClosedRawDaysArray[*]}" ]; then
+    if [ "$issuesClosed" -lt 1000 ]; then
+      heading="Time-to-close statistics for all closed issues"
+    else
+      heading="Time-to-close statistics for latest 1000 closed issues"
+    fi
+    writeStatsToHTMLFile "Fastest" "Longest" "closed-issues-ttc-stats" \
+      "$(printf '%s\n' "${issuesClosedRawDaysArray[@]}" | sort -n)"
+  fi
+fi
+echo "  </div>" >> "$htmlFile"
+fi
+fi
+
+# HTML closed PRs ####################################################
+
+if [ "$PRsClosed" != 0 ]; then
+cat << EOF >> "$htmlFile"
+    <div class="bargraph">
+    <h3 id="prs-merged-closed"><a href="#prs-merged-closed"><span>🔗</span>
+      PRs merged/closed</a></h3>
+    <p>
+    <a href="$linkBase+$PRsClosedQuery">$PRsClosed PRs</a>
+    were merged/closed as of $realdate
+    <p>$(divide "$PRsClosed" "$PRsCurrentlyOpen") times as many
+    closed PRs as open PRs.
+    <p class="svg">
+EOF
+
+PRsClosedQueryBase='type:issue+state:closed+created'
+
+if [ $hasGnuplot = true ]; then
+  title=""
+  [ "$PRsClosed" -ge 1000 ] && title="Latest 1000 merged/closed PRs"
+  writeBoxChartToHTMLFile "$title" "Month created" \
+    "Number of PRs merged/closed" "web-blue" "white"\
+    "$linkBase+$PRsClosedQueryBase" \
+    "$PRsClosedByMonth"
+else
+  if [ "$PRsClosed" -ge 1000 ]; then
+    caption="Latest 1000<br>closed PRs"
+  fi
+  cat << EOF >> "$htmlFile"
+    <table class="simple">
+      <caption>$caption
+      <thead>
+        <tr>
+          <th>Month<br>closed
+          <th>Closed<br>PRs
+      </thead>
+EOF
+  while IFS= read -r line; do
+    date=$(echo -n "$line" | cut -d " " -f1)
+    count=$(echo -n "$line" | cut -d " " -f2)
+  cat << EOF >> "$htmlFile"
+      <tr>
+        <td>$date
+        <td>$count
+EOF
+  done <<< "$PRsClosedByMonth"
+  cat << EOF >> "$htmlFile"
+    </table>
+EOF
+fi
+
+if [ $hasGnuplot = true ]; then
+  if [ -n "${PRsClosedRawDaysArray[*]}" ]; then
+    if [ "$PRsClosed" -lt 1000 ]; then
+      heading="Time-to-close statistics for all merged/closed PRs"
+    else
+      heading="Time-to-close statistics for latest 1000 merged/closed PRs"
+    fi
+    writeStatsToHTMLFile "Fastest" "Longest" "merged-closed-prs-ttc-stats" \
+      "$(printf '%s\n' "${PRsClosedRawDaysArray[@]}" | sort -n)"
+  fi
+fi
+fi
+
+cat << EOF >> "$htmlFile"
+  </div>
+</div>
+EOF
+
+# HTML page footer ###################################################
+
+cat << EOF >> "$htmlFile"
+<p>
+<a href="https://github.com/git-pulse/tools"><img height=18 alt="git-pulse logo" src="data:image/svg+xml;charset=utf-8;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNzkuMDggMzM2LjUyIj4KICA8cmFkaWFsR3JhZGllbnQKICAgICAgaWQ9InJhZGlhbEdyYWRpZW50MzczNCIKICAgICAgZ3JhZGllbnRVbml0cz0idXNlclNwYWNlT25Vc2UiCiAgICAgIGN5PSI2OTAuMjgiCiAgICAgIGN4PSI0NjcuNzEiCiAgICAgIGdyYWRpZW50VHJhbnNmb3JtPSJtYXRyaXgoMTQuNTcyIC0uMDAyMDExOSAuMDE2OTM5IDE4MC4wOSAtNjM1OS40IC0xLjIzNDVlNSkiCiAgICAgIHI9IjQwLjYyMyI+CiAgICA8c3RvcCBpZD0ic3RvcDM3MzAiIHN0eWxlPSJzdG9wLWNvbG9yOiMzMmNkMzIiIG9mZnNldD0iMCIgLz4KICAgIDxzdG9wIGlkPSJzdG9wMzczMiIgc3R5bGU9InN0b3AtY29sb3I6IzMyY2QzMjtzdG9wLW9wYWNpdHk6MCIgb2Zmc2V0PSIxIiAvPgogIDwvcmFkaWFsR3JhZGllbnQ+CiAgPGcgaWQ9ImxheWVyMSIgdHJhbnNmb3JtPSJ0cmFuc2xhdGUoLTQ2Ny43MSAtNjIzLjUzKSI+CiAgICA8cGF0aCBpZD0icGF0aDIzOTYiCiAgICAgICAgc3R5bGU9InN0cm9rZTp1cmwoI3JhZGlhbEdyYWRpZW50MzczNCk7c3Ryb2tlLXdpZHRoOjI0LjA0NTtmaWxsOm5vbmUiCiAgICAgICAgZD0ibTQ3OS43MyA4NTAuNjhzMTkuNjkgMTEgMjYuMzUgMTcuODRjMTAgMTAuMjcgMTkuMDUgNTIuOTggMjUuNyA0MC4yOCA0MC4yLTc2Ljc2IDU4LjEyLTI3My4yNSA1OC4xMi0yNzMuMjVzMC4zNyAxMjUuMzkgNy40MyAxNzguNTNjNS4zNCA0MC4yNiAxOS42NyAxNDkuNzEgMjkuODcgMTMyLjAyIDE3LjAyLTI5LjUxIDIyLjYzLTg3LjE2IDMyLjk3LTEyNi42NSA0Ljk1LTE4LjkyIDE4LjYzIDM3Ljk3IDMxLjIzIDU3LjI2IDUuNzIgOC43NiA0Ljk2LTMzLjE5IDE1LjYxLTMyLjEgMjYuMDMgMi42NiAyNy43NiAwLjg3IDI3Ljc2IDAuODciIC8+CiAgPC9nPgo8L3N2Zz4K"></a>
+<small>Generated with <a href="https://github.com/git-pulse/tools">git-pulse</a></small>
+EOF
+
+cat << EOF > "$jsonFile"
+{
+  "full_name": "$orgAndRepo",
+  "html_url": "$repoURL",
+  "start_date": "$startDate",
+  "end_date": "$endDate",
+  "months": $months,
+  "forks_count": $forksCount,
+  "cumulative_total_committers": $allCommitters,
+  "new_committers_per_month": $avgNewCommitters,
+  "total_active_committers_per_month": $avgUniqCommitters,
+  "new_committers_percentage": $newToUniqPercentage,
+  "commits_per_month": $avgCommits,
+  "commits_per_committer_per_month": $(divide \
+    $avgCommits $avgUniqCommitters),
+  "has_issues": $hasIssues,
+EOF
+if [ $hasIssues = true ]; then
+cat << EOF >> "$jsonFile"
+  "issues_closed_percentage": $issuesClosedPercentage,
+  "issues_closed_per_month": $avgIssuesClosed,
+  "issues_opened_per_month": $avgIssuesOpened,
+  "issues_increase_decrease": $(echo $avgIssuesDelta | tr -d '+'),
+  $issuesOpenStats
+  $issuesResolvedStats
+  "issues_open_count": $issuesCurrentlyOpen,
+  "issues_resolved_count": $issuesClosed,
+  "issues_resolved_to_open_ratio": $(divide \
+    "$issuesClosed" "$issuesCurrentlyOpen"),
+  "issues_resolved_to_commits_percentage": $closedIssuesToCommitsPercentage,
+  "issues_open_to_monthly_ratio": $(divide \
+    "$issuesCurrentlyOpen" "$avgIssuesOpened"),
+EOF
+fi
+cat << EOF >> "$jsonFile"
+  "PRs_merged_or_closed_percentage": $PRsMergedOrClosedPercentage,
+  "PRs_merged_vs_commits_ratio": $PRtoCommitPercentage,
+  "PRs_merged_per_month": $avgPRsMerged,
+  "PRs_closed_per_month": $avgPRsClosed,
+  "PRs_opened_per_month": $avgPRsOpened,
+  "PRs_increase_decrease": $(echo $avgPRsDelta | tr -d '+'),
+  $PRsOpenStats
+  $PRsResolvedStats
+  "PRs_open_count": $PRsCurrentlyOpen,
+  "PRs_resolved_count": $PRsClosed,
+  "PRs_resolved_to_open_ratio": $(divide \
+    "$PRsClosed" "$PRsCurrentlyOpen"),
+  "PRs_open_to_monthly_ratio": $(divide \
+    "$PRsCurrentlyOpen" "$avgPRsOpened")
+}
+EOF
+
+# console footer #####################################################
+
+if [[ $interactive != true ]]; then
+  echo -n "To interactively page through this snapshot in your terminal,"
+  echo " use the -i option:"
+  echo
+  echo "    bash ${BASH_SOURCE[*]} -i"
+fi
+
+echo
+echo -e "Open ${hi}$htmlFile${hiOff} to view this snapshot in your browser."
