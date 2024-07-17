@@ -779,7 +779,7 @@ else
 fi
 
 if [ -n "$token" ]; then
-  authorizationHeader="Authorization: token $GITHUB_TOKEN"
+  authorizationHeader="Authorization: token $token"
 fi
 
 issuesClosedArray=()
